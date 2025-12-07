@@ -1,1 +1,8 @@
 certs/
+
+# Host-specific files (not shared between hosts)
+domains.map
+
+# Auto-generated files (regenerate with ./generate-config.sh)
+conf.d/
+maps/
