@@ -1,0 +1,16 @@
+services:
+  haproxy:
+    image: haproxy:lts
+    container_name: haproxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - haproxy-net
+
+networks:
+  haproxy-net:
+    external: true
