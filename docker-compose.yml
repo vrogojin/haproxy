@@ -6,6 +6,7 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      - "8000:8000"
     volumes:
       - ./conf.d:/usr/local/etc/haproxy/conf.d:ro
       - ./maps:/usr/local/etc/haproxy/maps:ro
