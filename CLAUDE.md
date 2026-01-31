@@ -10,21 +10,10 @@ HAProxy reverse proxy setup for Docker that routes HTTP/HTTPS traffic to backend
 
 ```
 Internet → HAProxy (80/443) → Docker Network → Backend Containers
-                                              ├── friendly-dashboard (80/443)
-                                              └── ipfs-kubo (80/443)
 ```
 
-- **HTTP (port 80)**: Routed based on `Host` header
+- **HTTP (port 80)**: Routed based on `Host` header using map files
 - **HTTPS (port 443)**: SSL passthrough using SNI (Server Name Indication) - backends handle their own SSL termination
-
-## Domain Mappings
-
-| Domain | Backend Container |
-|--------|------------------|
-| friendly-miners.dyndns.org | friendly-dashboard |
-| unicity-ipfs1.dyndns.org | ipfs-kubo |
-
-**Note**: The `certs/` directory also contains certificates for `uniquake-dev.dyndns.org` and `sphere-test.dyndns.org` which are not currently routed.
 
 ## Commands
 
@@ -32,8 +21,11 @@ Internet → HAProxy (80/443) → Docker Network → Backend Containers
 # Create the shared Docker network (one-time setup)
 docker network create haproxy-net
 
+# Generate config from domains.map
+./generate-config.sh
+
 # Validate HAProxy configuration
-docker run --rm -v $(pwd)/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro haproxy:lts haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+docker run --rm -v $(pwd)/conf.d:/usr/local/etc/haproxy/conf.d:ro -v $(pwd)/maps:/usr/local/etc/haproxy/maps:ro haproxy:lts haproxy -c -f /usr/local/etc/haproxy/conf.d
 
 # Start HAProxy
 docker compose up -d
@@ -41,8 +33,8 @@ docker compose up -d
 # View logs
 docker compose logs -f haproxy
 
-# Reload configuration (after editing haproxy.cfg)
-docker kill -s HUP haproxy
+# Reload configuration (after regenerating config)
+docker restart haproxy
 
 # Stop HAProxy
 docker compose down
@@ -50,73 +42,59 @@ docker compose down
 
 ## Adding New Domain Mappings
 
-Edit `haproxy.cfg` and add:
-
-1. In `frontend http-in`:
+1. Edit `domains.map` and add a line:
    ```
-   acl host_newdomain hdr(host) -i newdomain.example.com
-   use_backend newcontainer-http if host_newdomain
+   newdomain.example.com    container-name    80    443
    ```
 
-2. In `frontend https-in`:
-   ```
-   acl sni_newdomain req.ssl_sni -i newdomain.example.com
-   use_backend newcontainer-https if sni_newdomain
-   ```
-
-3. Add backends (use `init-addr last,libc,none` to handle DNS resolution when backends start after HAProxy):
-   ```
-   backend newcontainer-http
-       mode http
-       server newcontainer newcontainer:80 check init-addr last,libc,none
-
-   backend newcontainer-https
-       mode tcp
-       server newcontainer newcontainer:443 check init-addr last,libc,none
+2. Regenerate config and restart:
+   ```bash
+   ./generate-config.sh && docker restart haproxy
    ```
 
-4. Reload: `docker kill -s HUP haproxy`
+## Config Generation
 
-## Backend Container Configuration
+The `generate-config.sh` script reads `domains.map` and generates:
+- `conf.d/20-backends.cfg` - Backend definitions
+- `maps/http-domains.map` - HTTP routing map
+- `maps/https-domains.map` - HTTPS routing map
+
+Template files in `templates/` provide the base configuration:
+- `00-global.cfg` - Global settings and defaults
+- `10-frontends.cfg` - Frontend definitions with map-based routing
+
+## Backend Container Requirements
 
 Backend containers must:
+1. **Join the haproxy-net network** (as external network in their docker-compose.yml)
+2. **Use exact container names** as specified in `domains.map`
+3. **Handle their own SSL** - HAProxy passes TLS connections through unchanged
 
-1. **Join the haproxy-net network**:
-   ```yaml
-   # In backend's docker-compose.yml
-   services:
-     your-service:
-       container_name: friendly-dashboard  # Must match haproxy.cfg
-       networks:
-         - haproxy-net
-
-   networks:
-     haproxy-net:
-       external: true
-   ```
-
-2. **Use exact container names** as specified in haproxy.cfg (`friendly-dashboard`, `ipfs-kubo`)
-
-3. **Expose ports 80 and 443** internally (no need to publish to host since HAProxy handles external access)
-
-4. **Handle their own SSL** - certificates stay on backend containers
+See `BACKEND-SETUP.md` for detailed configuration examples.
 
 ## Key Behaviors
 
 - **Default backends**: Requests to unmatched domains return 503 (HTTP) or connection refused (HTTPS)
 - **DNS resilience**: Uses `init-addr last,libc,none` so HAProxy starts even if backends aren't running yet
-- **Health checks**: Each backend has `check` enabled for automatic failover
+- **Health checks**: HTTPS backends have health checks with `inter 5s fall 3 rise 2`
 
 ## File Structure
 
-- `haproxy.cfg` - Main HAProxy configuration
-- `docker-compose.yml` - HAProxy container definition
-- `BACKEND-SETUP.md` - Detailed instructions for configuring backend containers
-- `certs/` - SSL certificates managed by Certbot (unused with passthrough mode)
+- `domains.map` - Domain to container mappings (host-specific, gitignored)
+- `generate-config.sh` - Config generation script
+- `templates/` - Base HAProxy config templates
+- `conf.d/` - Generated config files (gitignored)
+- `maps/` - Generated map files (gitignored)
 
-## Certificate Management
+## Troubleshooting
 
-Certificates in `certs/` are managed by Certbot. Currently unused since SSL passthrough delegates certificate handling to backend containers. If switching to SSL termination mode, use:
 ```bash
-cat fullchain.pem privkey.pem > haproxy.pem
+# Check if backend containers are on the network
+docker network inspect haproxy-net
+
+# Test connectivity from HAProxy to a backend
+docker exec haproxy ping <container-name>
+
+# Check HAProxy backend status
+docker logs haproxy 2>&1 | grep -i backend
 ```
