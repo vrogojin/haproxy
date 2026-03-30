@@ -95,7 +95,8 @@ POST /v1/backends
   "container": "my-backend",
   "http_port": 80,
   "https_port": 443,
-  "map_port": null
+  "map_port": null,
+  "extra_ports": null
 }
 ```
 
@@ -106,6 +107,7 @@ POST /v1/backends
 | `http_port` | integer or null | no | `80` | HTTP port on the backend container. Set to `null` to skip HTTP routing. |
 | `https_port` | integer or null | no | `443` | HTTPS port on the backend container. Set to `null` to skip HTTPS routing. |
 | `map_port` | integer or null | no | `null` | Map download port (routed via HAProxy port 8000). Set to `null` to skip. |
+| `extra_ports` | array or null | no | `null` | Additional port mappings beyond http/https/map. Each entry: `{"listen": <int>, "target": <int>, "mode": "http"|"tcp"}`. See Section 2.4. |
 
 Port values must be in range 1-65535 when specified.
 
@@ -120,6 +122,7 @@ At least one of `http_port` or `https_port` must be non-null.
   "http_port": 80,
   "https_port": 443,
   "map_port": null,
+  "extra_ports": null,
   "created_at": "2026-03-30T14:22:00Z"
 }
 ```
@@ -133,6 +136,7 @@ At least one of `http_port` or `https_port` must be non-null.
   "http_port": 80,
   "https_port": 443,
   "map_port": null,
+  "extra_ports": null,
   "created_at": "2026-03-30T14:20:00Z",
   "message": "Already registered with identical configuration"
 }
@@ -149,7 +153,8 @@ At least one of `http_port` or `https_port` must be non-null.
     "container": "other-backend",
     "http_port": 80,
     "https_port": 443,
-    "map_port": null
+    "map_port": null,
+    "extra_ports": null
   }
 }
 ```
@@ -197,6 +202,21 @@ curl -s -X POST http://haproxy:8404/v1/backends \
     "map_port": 9000
   }'
 
+# Register with extra ports (Fulcrum Electrum server)
+curl -s -X POST http://haproxy:8404/v1/backends \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domain": "electrum.example.com",
+    "container": "fulcrum-alpha",
+    "http_port": 80,
+    "https_port": 50002,
+    "extra_ports": [
+      {"listen": 50001, "target": 50001, "mode": "tcp"},
+      {"listen": 50003, "target": 50003, "mode": "http"},
+      {"listen": 50004, "target": 50004, "mode": "tcp"}
+    ]
+  }'
+
 # Idempotent re-registration (returns 200, no config change)
 curl -s -X POST http://haproxy:8404/v1/backends \
   -H "Content-Type: application/json" \
@@ -229,6 +249,7 @@ No request body. No query parameters.
       "http_port": 80,
       "https_port": 443,
       "map_port": null,
+      "extra_ports": null,
       "created_at": "2026-01-30T20:50:00Z"
     },
     {
@@ -237,6 +258,7 @@ No request body. No query parameters.
       "http_port": 8888,
       "https_port": 8888,
       "map_port": 8000,
+      "extra_ports": null,
       "created_at": "2026-01-30T20:50:00Z"
     }
   ],
@@ -269,6 +291,7 @@ The `{domain}` path parameter is the domain name, URL-encoded if it contains spe
   "http_port": 80,
   "https_port": 443,
   "map_port": null,
+  "extra_ports": null,
   "created_at": "2026-01-30T20:50:00Z"
 }
 ```
@@ -431,6 +454,91 @@ curl -s http://haproxy:8404/v1/health
 
 ---
 
+### 2.4 Extra Port Mappings
+
+The `extra_ports` field enables HAProxy to proxy traffic on non-standard ports. This is essential for services that use ports beyond 80/443, such as:
+
+- **Electrum TCP** (50001): Raw TCP protocol, no TLS
+- **Electrum WebSocket** (50003): WebSocket over HTTP
+- **Electrum WebSocket Secure** (50004): WebSocket over TLS
+
+#### Entry Schema
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `listen` | integer | yes | HAProxy frontend port (what external clients connect to) |
+| `target` | integer | yes | Backend container port (where traffic is forwarded) |
+| `mode` | string | yes | `"http"` for HTTP/WebSocket, `"tcp"` for raw TCP/TLS passthrough |
+
+#### Validation Rules
+
+- `listen` must be 1-65535 and not conflict with reserved ports (80, 443, 8000, 8404)
+- `target` must be 1-65535
+- `mode` must be `"http"` or `"tcp"`
+- Maximum 10 extra ports per registration
+- The same `listen` port can be used by multiple domains (shared frontend with domain routing)
+
+#### WebSocket Support
+
+HAProxy in HTTP mode (`"mode": "http"`) transparently supports the WebSocket upgrade mechanism:
+- The `Connection: Upgrade` and `Upgrade: websocket` headers are forwarded to the backend
+- HAProxy maintains the bidirectional WebSocket connection after the upgrade
+- No special HAProxy configuration is needed -- it works automatically in HTTP mode
+- For WebSocket Secure (WSS), use `"mode": "tcp"` -- HAProxy does TLS passthrough, and the backend handles both TLS termination and WebSocket upgrade
+
+#### HAProxy Frontend Generation
+
+For each unique `listen` port across all registrations, `generate-config.sh` creates:
+
+**HTTP mode:**
+```haproxy
+frontend extra-http-50003
+    mode http
+    bind *:50003
+    use_backend %[req.hdr(host),lower,map(/etc/haproxy/maps/extra-50003-domains.map,no-match)]
+```
+
+**TCP mode:**
+```haproxy
+frontend extra-tcp-50004
+    mode tcp
+    bind *:50004
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+    use_backend %[req.ssl_sni,lower,map(/etc/haproxy/maps/extra-50004-domains.map,no-match-tcp)]
+```
+
+**TCP mode (single domain, no TLS/SNI):**
+```haproxy
+frontend extra-tcp-50001
+    mode tcp
+    bind *:50001
+    default_backend electrum-tcp-50001
+```
+
+When a `listen` port has only one domain and mode is `tcp`, SNI routing is skipped and `default_backend` is used directly. This supports raw TCP protocols (like Electrum TCP) that have no TLS and no Host header.
+
+#### Port Publishing
+
+Extra ports must be published when starting the HAProxy container. Since Docker port publishing is static, operators should publish the ports they intend to use:
+
+```bash
+docker run -d \
+    -p 80:80 -p 443:443 \
+    -p 50001:50001 -p 50002:50002 -p 50003:50003 -p 50004:50004 \
+    haproxy-api:latest
+```
+
+Or in docker-compose:
+```yaml
+ports:
+    - "80:80"
+    - "443:443"
+    - "50001-50004:50001-50004"
+```
+
+---
+
 ## 3. Implementation Architecture
 
 ### 3.1 Approach: Custom HAProxy Image with Embedded API
@@ -476,10 +584,12 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
     10-frontends.cfg
     15-frontend-mapdownload.cfg
     20-backends.cfg
+    30-extra-frontends.cfg    # Generated frontends for extra_ports
   maps/                       # Generated map files (read-write)
     http-domains.map
     https-domains.map
     mapdownload-domains.map
+    extra-<port>-domains.map  # Per-port map files for extra_ports
   state/                      # API state (timestamps, lock files)
     registrations.json         # Metadata not captured in domains.map (created_at timestamps)
 
@@ -684,6 +794,11 @@ When a `POST /v1/backends` or `DELETE /v1/backends/{domain}` request arrives:
    - POST: validate no conflict, append new line (or return 200/409)
    - DELETE: remove matching line (or return 404)
 5. Write updated domains.map atomically (write to temp file, rename)
+5a. For each extra_port entry in the registration:
+   - Add the domain→backend mapping to maps/extra-<listen>-domains.map
+   - Add a backend block to 20-backends.cfg for the extra port
+   - If the frontend for this listen port doesn't exist yet, add it to a new
+     conf.d/30-extra-frontends.cfg file
 6. Run generate-config.sh (child_process.execFile with timeout: 30000):
    - Copies templates to conf.d/
    - Generates conf.d/20-backends.cfg from domains.map
@@ -861,22 +976,32 @@ The `reload_timeout` of 10 seconds is generous; in practice, HAProxy reloads com
 
 ### 6.1 domains.map Format
 
-The file format is unchanged from the current implementation:
+The file format extends the current implementation with optional extra port fields:
 
 ```
 # HAProxy Domain Mappings
-# Format: domain  container  http_port  https_port  [map_port]
+# Format: domain  container  http_port  https_port  [map_port]  [extra:listen:target:mode] ...
 #
 # Fields:
 #   domain     - The domain name to route
 #   container  - Container alias on haproxy-net
 #   http_port  - HTTP port (or - to skip)
 #   https_port - HTTPS port (or - to skip)
-#   map_port   - Optional: Map download port (port 8000)
+#   map_port   - Optional: Map download port (port 8000), or - to skip
+#   extra:*    - Optional: Extra port mappings (extra:listen:target:mode), repeatable
+#
+# Examples:
+#   Standard web service:
+#     friendly-miners.dyndns.org  friendly-dashboard  80  443
+#   With map download port:
+#     busydaddyrust-dev.dyndns.org  lgsm  8888  8888  8000
+#   With extra ports (Electrum server):
+#     electrum.example.com  fulcrum-alpha  80  50002  -  extra:50001:50001:tcp  extra:50003:50003:http  extra:50004:50004:tcp
 
 friendly-miners.dyndns.org      friendly-dashboard    80    443
 dev-aggregator.dyndns.org       dev-aggregator        80    443
 busydaddyrust-dev.dyndns.org    lgsm                  8888  8888  8000
+electrum.example.com            fulcrum-alpha         80    50002  -  extra:50001:50001:tcp  extra:50003:50003:http  extra:50004:50004:tcp
 ```
 
 Rules:
@@ -884,8 +1009,10 @@ Rules:
 - Empty lines are preserved.
 - Fields are whitespace-separated.
 - `http_port` or `https_port` set to `-` means skip that protocol.
-- `map_port` is optional. Omitted means no map download routing.
+- `map_port` is optional. Omitted or `-` means no map download routing.
+- Extra port fields follow the format `extra:<listen>:<target>:<mode>` and can be repeated.
 - The domain field is the primary key (one entry per domain).
+- The format is backward-compatible: existing 4-5 field lines (without extra port fields) continue to work unchanged.
 
 ### 6.2 API-to-File Field Mapping
 
@@ -895,7 +1022,8 @@ Rules:
 | `container` | Column 2 | Required, never null |
 | `http_port` | Column 3 | `null` in JSON becomes `-` in file |
 | `https_port` | Column 4 | `null` in JSON becomes `-` in file |
-| `map_port` | Column 5 | `null` in JSON means column is omitted |
+| `map_port` | Column 5 | `null` in JSON means column is omitted (or `-` if extra ports follow) |
+| `extra_ports` | Columns 6+ | `null` in JSON means no extra columns. Each entry becomes `extra:<listen>:<target>:<mode>`. When `extra_ports` is non-null and `map_port` is null, column 5 is written as `-` to maintain positional alignment. |
 
 ### 6.3 State File: registrations.json
 
@@ -944,6 +1072,7 @@ services:
       - "80:80"
       - "443:443"
       - "8000:8000"
+      - "50001-50004:50001-50004"  # Electrum protocol ports (add ranges as needed)
       # Port 8404 is NOT published — API is internal only
     volumes:
       - haproxy-data:/etc/haproxy
@@ -1004,6 +1133,7 @@ RUN ln -sf /etc/haproxy/maps /usr/local/etc/haproxy/maps && \
     ln -sf /etc/haproxy/conf.d /usr/local/etc/haproxy/conf.d
 
 EXPOSE 80 443 8000 8404
+# Extra ports (e.g., 50001-50004 for Electrum) are published at runtime
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
@@ -1085,6 +1215,46 @@ networks:
 ```
 
 The retry loop handles the case where the backend container starts before HAProxy is ready.
+
+A Fulcrum Electrum server with extra ports would register like this:
+
+```yaml
+# docker-compose.yml for Fulcrum Electrum server
+services:
+  fulcrum:
+    image: fulcrum-alpha:latest
+    container_name: fulcrum-alpha
+    networks:
+      - haproxy-net
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Register with HAProxy (includes extra ports for Electrum protocols)
+        for i in 1 2 3 4 5; do
+          curl -sf -X POST http://haproxy:8404/v1/backends \
+            -H "Content-Type: application/json" \
+            -d '{
+              "domain":"electrum.example.com",
+              "container":"fulcrum-alpha",
+              "http_port":80,
+              "https_port":50002,
+              "extra_ports":[
+                {"listen":50001,"target":50001,"mode":"tcp"},
+                {"listen":50003,"target":50003,"mode":"http"},
+                {"listen":50004,"target":50004,"mode":"tcp"}
+              ]
+            }' && break
+          echo "HAProxy not ready, retrying in 5s..."
+          sleep 5
+        done
+
+        # Start Fulcrum
+        exec /usr/local/bin/Fulcrum /etc/fulcrum/alpha.conf
+
+networks:
+  haproxy-net:
+    external: true
+```
 
 ### 7.8 Deregistration on Shutdown
 
@@ -1281,6 +1451,10 @@ All inputs are validated before being written to `domains.map`:
 | `http_port` | Integer 1-65535 or null | Port range validation |
 | `https_port` | Integer 1-65535 or null | Port range validation |
 | `map_port` | Integer 1-65535 or null | Port range validation |
+| `extra_ports` | Array of objects or null, max 10 entries | Limits frontend proliferation |
+| `extra_ports[].listen` | Integer 1-65535, not in {80, 443, 8000, 8404} | Prevents conflict with reserved frontends |
+| `extra_ports[].target` | Integer 1-65535 | Port range validation |
+| `extra_ports[].mode` | Must be `"http"` or `"tcp"` | Only valid HAProxy modes |
 
 The domain and container validation patterns are restrictive by design. They reject any characters that could be interpreted by the shell (`$`, `` ` ``, `\`, `;`, `|`, `&`, spaces, newlines) or by HAProxy configuration parsing.
 
@@ -1348,6 +1522,19 @@ Internet
 
 The trust boundary is the `haproxy-net` network. Everything inside it is trusted. The API has no internet exposure.
 
+### 10.7 Extra Port Security
+
+Extra port frontends are created dynamically based on registrations. An attacker
+with API access could register a high port and create a new HAProxy frontend.
+This is mitigated by:
+- Port validation (1-65535, not in reserved set {80, 443, 8000, 8404})
+- Maximum 10 extra ports per registration
+- `HAPROXY_API_KEY` authentication (when enabled)
+
+The HAProxy container must still publish these ports via Docker for them to be
+externally reachable. An API registration alone does NOT make a port reachable
+from the internet -- Docker port publishing is required.
+
 ---
 
 ## Appendix A: Complete curl Reference
@@ -1379,6 +1566,11 @@ curl -s -X POST http://haproxy:8404/v1/backends \
 curl -s -X POST http://haproxy:8404/v1/backends \
   -H "Content-Type: application/json" \
   -d '{"domain":"maps.example.com","container":"map-server","http_port":80,"https_port":443,"map_port":9000}'
+
+# Register with extra ports (Electrum server with TCP, WS, WSS)
+curl -s -X POST http://haproxy:8404/v1/backends \
+  -H "Content-Type: application/json" \
+  -d '{"domain":"electrum.example.com","container":"fulcrum-alpha","http_port":80,"https_port":50002,"extra_ports":[{"listen":50001,"target":50001,"mode":"tcp"},{"listen":50003,"target":50003,"mode":"http"},{"listen":50004,"target":50004,"mode":"tcp"}]}'
 
 # Register with defaults (http_port=80, https_port=443)
 curl -s -X POST http://haproxy:8404/v1/backends \
@@ -1434,6 +1626,7 @@ Given this `domains.map`:
 friendly-miners.dyndns.org      friendly-dashboard    80    443
 busydaddyrust-dev.dyndns.org    lgsm                  8888  8888  8000
 myapp.example.com               myapp-web             8080  8443
+electrum.example.com            fulcrum-alpha         80    50002  -  extra:50001:50001:tcp  extra:50003:50003:http  extra:50004:50004:tcp
 ```
 
 The generated files would be:
@@ -1470,6 +1663,49 @@ backend myapp-web-http
 backend myapp-web-https
     mode tcp
     server myapp-web myapp-web:8443 check inter 5s fall 3 rise 2 init-addr last,libc,none
+
+backend fulcrum-alpha-http
+    mode http
+    server fulcrum-alpha fulcrum-alpha:80 init-addr last,libc,none
+
+backend fulcrum-alpha-https
+    mode tcp
+    server fulcrum-alpha fulcrum-alpha:50002 check inter 5s fall 3 rise 2 init-addr last,libc,none
+
+# Extra port backends
+backend fulcrum-alpha-tcp-50001
+    mode tcp
+    server fulcrum-alpha fulcrum-alpha:50001 init-addr last,libc,none
+
+backend fulcrum-alpha-http-50003
+    mode http
+    server fulcrum-alpha fulcrum-alpha:50003 init-addr last,libc,none
+
+backend fulcrum-alpha-tcp-50004
+    mode tcp
+    server fulcrum-alpha fulcrum-alpha:50004 init-addr last,libc,none
+```
+
+**conf.d/30-extra-frontends.cfg:**
+```
+# Auto-generated extra port frontends
+
+frontend extra-tcp-50001
+    mode tcp
+    bind *:50001
+    default_backend fulcrum-alpha-tcp-50001
+
+frontend extra-http-50003
+    mode http
+    bind *:50003
+    use_backend %[req.hdr(host),lower,map(/etc/haproxy/maps/extra-50003-domains.map,no-match)]
+
+frontend extra-tcp-50004
+    mode tcp
+    bind *:50004
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req_ssl_hello_type 1 }
+    use_backend %[req.ssl_sni,lower,map(/etc/haproxy/maps/extra-50004-domains.map,no-match-tcp)]
 ```
 
 **maps/http-domains.map:**
@@ -1477,6 +1713,7 @@ backend myapp-web-https
 friendly-miners.dyndns.org    friendly-dashboard-http
 busydaddyrust-dev.dyndns.org    lgsm-http
 myapp.example.com    myapp-web-http
+electrum.example.com    fulcrum-alpha-http
 ```
 
 **maps/https-domains.map:**
@@ -1484,11 +1721,22 @@ myapp.example.com    myapp-web-http
 friendly-miners.dyndns.org    friendly-dashboard-https
 busydaddyrust-dev.dyndns.org    lgsm-https
 myapp.example.com    myapp-web-https
+electrum.example.com    fulcrum-alpha-https
 ```
 
 **maps/mapdownload-domains.map:**
 ```
 busydaddyrust-dev.dyndns.org    lgsm-mapdownload
+```
+
+**maps/extra-50003-domains.map:**
+```
+electrum.example.com    fulcrum-alpha-http-50003
+```
+
+**maps/extra-50004-domains.map:**
+```
+electrum.example.com    fulcrum-alpha-tcp-50004
 ```
 
 ---
