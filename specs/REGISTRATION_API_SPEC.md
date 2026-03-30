@@ -247,7 +247,7 @@ No request body. No query parameters.
 **Example:**
 
 ```bash
-curl -s http://haproxy:8404/v1/backends | python3 -m json.tool
+curl -s http://haproxy:8404/v1/backends | jq .
 ```
 
 ---
@@ -435,7 +435,7 @@ curl -s http://haproxy:8404/v1/health
 
 ### 3.1 Approach: Custom HAProxy Image with Embedded API
 
-The API runs as a lightweight Python 3 HTTP server inside the same container as HAProxy. This is chosen over a sidecar container for simplicity: single container, no PID namespace sharing, no Docker socket mounting, straightforward signal delivery.
+The API runs as a lightweight Node.js HTTP server inside the same container as HAProxy. This is chosen over a sidecar container for simplicity: single container, no PID namespace sharing, no Docker socket mounting, straightforward signal delivery. Node.js aligns with the broader Unicity stack, which is predominantly TypeScript/Node.js (5+ repositories), avoiding the introduction of Python as a runtime dependency solely for a small API server.
 
 ### 3.2 Image Layout
 
@@ -443,7 +443,7 @@ The API runs as a lightweight Python 3 HTTP server inside the same container as 
 FROM haproxy:lts
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 procps && \
+    apt-get install -y --no-install-recommends nodejs npm procps && \
     rm -rf /var/lib/apt/lists/*
 
 # Config generation
@@ -451,13 +451,12 @@ COPY generate-config.sh /usr/local/bin/generate-config.sh
 COPY templates/ /usr/local/share/haproxy/templates/
 
 # Registration API
-COPY registration-api.py /usr/local/bin/registration-api.py
+COPY registration-api.mjs /usr/local/bin/registration-api.mjs
 
 # Entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \
-             /usr/local/bin/generate-config.sh \
-             /usr/local/bin/registration-api.py
+             /usr/local/bin/generate-config.sh
 
 # Writable directories for dynamic config
 RUN mkdir -p /etc/haproxy/conf.d \
@@ -492,7 +491,7 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 /usr/local/bin/
   generate-config.sh          # Config generation script (baked into image)
-  registration-api.py         # The API server (baked into image)
+  registration-api.mjs        # The API server (baked into image)
   entrypoint.sh               # Process manager (baked into image)
 ```
 
@@ -501,7 +500,7 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 The `entrypoint.sh` script manages two processes:
 
 1. **HAProxy master process** (PID 1 via `exec` for the final process, or managed explicitly)
-2. **Registration API** (Python HTTP server, background process)
+2. **Registration API** (Node.js HTTP server, background process)
 
 Process management approach: the entrypoint starts the API server in the background, then `exec`s into HAProxy as PID 1. The API server is a child process. If HAProxy exits, the container stops. The API server is non-critical; if it crashes, HAProxy continues to serve traffic.
 
@@ -540,11 +539,7 @@ STATE_DIR="/etc/haproxy/state"
     while true; do
         START_TIME=$(date +%s)
         echo "Starting Registration API on port 8404..."
-        python3 /usr/local/bin/registration-api.py \
-            --port 8404 \
-            --config-dir "$CONF_DIR" \
-            --domains-map "$DOMAINS_MAP" \
-            --templates-dir "$TEMPLATES_DIR" 2>&1
+        node /usr/local/bin/registration-api.mjs 2>&1
         EXIT_CODE=$?
         ELAPSED=$(( $(date +%s) - START_TIME ))
 
@@ -581,90 +576,96 @@ Key detail: HAProxy is started with `-W` (master-worker mode), which enables gra
 
 ### 3.5 Registration API Implementation
 
-The API is implemented as a single Python 3 file using only standard library modules (`http.server`, `json`, `subprocess`, `os`, `signal`, `re`, `datetime`, `threading`, `fcntl`). No pip dependencies.
+The API is implemented as a single Node.js ES module file (`registration-api.mjs`) using only Node.js built-in modules (`http`, `fs`, `path`, `child_process`, `os`). No npm dependencies required.
 
 Key implementation details:
 
-- **Threading**: Uses `ThreadingHTTPServer` for concurrent request handling.
-- **File locking**: Uses `fcntl.flock()` with `LOCK_NB` and a 60-second polling deadline on `domains.map` to serialize concurrent writes (see Section 8.3).
-- **Config regeneration**: Shells out to `generate-config.sh` after modifying `domains.map` (`subprocess.run` with `timeout=30`).
-- **HAProxy reload**: Sends `SIGUSR2` to the HAProxy master process after config regeneration.
+- **Async handling**: Uses Node.js built-in `http.createServer` with async request handlers. Node's event loop naturally handles concurrent requests without threading.
+- **File locking**: Uses `fs.open` with `O_EXLOCK` flag (or a simple lock file with `O_EXCL | O_CREAT`) with a 60-second polling retry to serialize concurrent writes to `domains.map`.
+- **Config regeneration**: Shells out to `generate-config.sh` via `child_process.execFile` with a 30-second timeout.
+- **HAProxy reload**: Sends `SIGUSR2` to the HAProxy master process via `process.kill(pid, 'SIGUSR2')`.
 - **Reload confirmation**: After `SIGUSR2`, polls for new HAProxy worker PIDs to verify the reload succeeded (10-second timeout; see Section 5.7).
-- **Config validation**: Runs `haproxy -c -f /etc/haproxy/conf.d` before reloading (`subprocess.run` with `timeout=30`) to catch config errors before they affect the running instance.
+- **Config validation**: Runs `haproxy -c -f /etc/haproxy/conf.d` via `child_process.execFile` with a 30-second timeout.
 - **Authentication**: Optional bearer token auth via `HAPROXY_API_KEY` environment variable (see Section 10.2).
 - **Rate limiting**: `MAX_REGISTRATIONS` env var (default: 100) caps total registered backends (see Section 10.5).
-- **Reload debouncing**: Coalesces rapid registrations within a 2-second window into a single reload cycle (see Section 10.5).
+- **Reload debouncing**: Coalesces rapid registrations within a 2-second window using `setTimeout`/`clearTimeout` into a single reload cycle (see Section 10.5).
 
 ### 3.6 Registration API Pseudocode
 
-```python
-class RegistrationHandler(BaseHTTPRequestHandler):
+```javascript
+import { createServer } from 'node:http';
+import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
-    def do_POST(self):
-        if self.path == "/v1/backends":
-            self.handle_register()
-        elif self.path == "/v1/reload":
-            self.handle_reload()
-        else:
-            self.send_error(404)
+const execFileAsync = promisify(execFile);
 
-    def do_GET(self):
-        if self.path == "/v1/backends":
-            self.handle_list()
-        elif self.path.startswith("/v1/backends/"):
-            domain = self.path[len("/v1/backends/"):]
-            self.handle_get(domain)
-        elif self.path == "/v1/health":
-            self.handle_health()
-        else:
-            self.send_error(404)
+const PORT = parseInt(process.env.HAPROXY_API_PORT || '8404');
+const DOMAINS_MAP = process.env.HAPROXY_DOMAINS_MAP || '/etc/haproxy/domains.map';
+const CONF_DIR = process.env.HAPROXY_CONF_DIR || '/etc/haproxy/conf.d';
+const TEMPLATES_DIR = process.env.HAPROXY_TEMPLATES_DIR || '/usr/local/share/haproxy/templates';
+const API_KEY = process.env.HAPROXY_API_KEY || '';
+const MAX_REGISTRATIONS = parseInt(process.env.MAX_REGISTRATIONS || '100');
 
-    def do_DELETE(self):
-        if self.path.startswith("/v1/backends/"):
-            domain = self.path[len("/v1/backends/"):]
-            self.handle_delete(domain)
-        else:
-            self.send_error(404)
+const server = createServer(async (req, res) => {
+    try {
+        const url = new URL(req.url, `http://localhost:${PORT}`);
 
-    def handle_register(self):
-        body = json.loads(self.rfile.read(content_length))
-        # Check HAPROXY_API_KEY auth if configured
-        # Validate fields
-        # Check MAX_REGISTRATIONS limit
-        # Acquire file lock on domains.map (LOCK_NB with 60s polling deadline)
-        # Parse existing entries
-        # Check for conflicts (same domain, different container/ports -> 409)
-        # Check for idempotent match (same domain, same everything -> 200)
-        # Append new entry -> 201
-        # Schedule debounced reload (2s timer; see Section 10.5)
-        # Run generate-config.sh (subprocess timeout=30)
-        # Validate config with haproxy -c (subprocess timeout=30)
-        # Send SIGUSR2 to HAProxy master
-        # Verify reload succeeded (poll for new worker PIDs, 10s timeout; see Section 5.7)
-        # Release file lock
+        if (req.method === 'POST' && url.pathname === '/v1/backends') {
+            await handleRegister(req, res);
+        } else if (req.method === 'GET' && url.pathname === '/v1/backends') {
+            await handleList(req, res);
+        } else if (req.method === 'GET' && url.pathname.startsWith('/v1/backends/')) {
+            const domain = decodeURIComponent(url.pathname.slice('/v1/backends/'.length));
+            await handleGet(req, res, domain);
+        } else if (req.method === 'DELETE' && url.pathname.startsWith('/v1/backends/')) {
+            const domain = decodeURIComponent(url.pathname.slice('/v1/backends/'.length));
+            await handleDelete(req, res, domain);
+        } else if (req.method === 'POST' && url.pathname === '/v1/reload') {
+            await handleReload(req, res);
+        } else if (req.method === 'GET' && url.pathname === '/v1/health') {
+            await handleHealth(req, res);
+        } else {
+            sendJson(res, 404, { error: 'Not found', code: 'NOT_FOUND' });
+        }
+    } catch (err) {
+        console.error('Unhandled error:', err);
+        sendJson(res, 500, { error: 'Internal server error', code: 'INTERNAL_ERROR' });
+    }
+});
 
-    def handle_delete(self, domain):
-        # Acquire file lock on domains.map
-        # Read all lines, filter out the matching domain
-        # Write back filtered lines
-        # Run generate-config.sh
-        # Validate and reload
-        # Release file lock
+server.listen(PORT, () => console.log(`Registration API listening on port ${PORT}`));
 
-    def handle_reload(self):
-        # Run generate-config.sh
-        # Validate config with haproxy -c
-        # Send SIGUSR2 to HAProxy master
+async function handleRegister(req, res) {
+    // Check HAPROXY_API_KEY auth if configured
+    // Parse and validate JSON body
+    // Check MAX_REGISTRATIONS limit
+    // Acquire file lock on domains.map (poll with 60s deadline)
+    // Parse existing entries
+    // Check for conflicts (same domain, different container/ports → 409)
+    // Check for idempotent match (same domain, same everything → 200)
+    // Append new entry → 201
+    // Schedule debounced reload (2s timer via setTimeout)
+    // Run generate-config.sh (execFile with timeout: 30000)
+    // Validate config with haproxy -c (execFile with timeout: 30000)
+    // Send SIGUSR2 to HAProxy master
+    // Verify reload (poll for new worker PIDs, 10s timeout)
+    // Release file lock
+}
 
-    def handle_list(self):
-        # Parse domains.map, return all entries as JSON
+async function handleDelete(req, res, domain) {
+    // Verify container ownership (source IP vs Docker DNS)
+    // Acquire file lock
+    // Read all lines, filter out matching domain
+    // Write back filtered lines
+    // Regenerate config and reload
+    // Release file lock
+}
 
-    def handle_get(self, domain):
-        # Parse domains.map, find matching domain, return as JSON or 404
-
-    def handle_health(self):
-        # Check HAProxy master process is alive
-        # Return status
+function sendJson(res, status, data) {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
+}
 ```
 
 ---
@@ -676,18 +677,18 @@ class RegistrationHandler(BaseHTTPRequestHandler):
 When a `POST /v1/backends` or `DELETE /v1/backends/{domain}` request arrives:
 
 ```
-1. Acquire exclusive file lock on domains.map (fcntl.flock LOCK_NB with 60s polling deadline; see Section 8.3)
+1. Acquire exclusive file lock on domains.map (lock file with O_EXCL and 60s polling deadline; see Section 8.3)
 2. Read current domains.map content
 3. Parse all non-comment, non-empty lines into structured entries
 4. Apply the change:
    - POST: validate no conflict, append new line (or return 200/409)
    - DELETE: remove matching line (or return 404)
 5. Write updated domains.map atomically (write to temp file, rename)
-6. Run generate-config.sh (subprocess.run with timeout=30):
+6. Run generate-config.sh (child_process.execFile with timeout: 30000):
    - Copies templates to conf.d/
    - Generates conf.d/20-backends.cfg from domains.map
    - Generates maps/*.map from domains.map
-7. Validate generated config: haproxy -c -f /etc/haproxy/conf.d (subprocess.run with timeout=30)
+7. Validate generated config: haproxy -c -f /etc/haproxy/conf.d (child_process.execFile with timeout: 30000)
 8. If validation fails: roll back domains.map from backup, return 500
 9. If validation succeeds: record current HAProxy worker PIDs, send SIGUSR2 to HAProxy master process
 10. Verify reload succeeded: poll for new worker PIDs (200ms interval, 10s timeout; see Section 5.7)
@@ -750,10 +751,10 @@ API receives POST /v1/backends
   -> writes domains.map
   -> schedules debounced reload (2s timer, reset on subsequent writes)
   -> [timer fires]
-  -> runs generate-config.sh (generates conf.d/ and maps/, timeout=30s)
-  -> runs haproxy -c -f /etc/haproxy/conf.d (validation, timeout=30s)
+  -> runs generate-config.sh (generates conf.d/ and maps/, timeout: 30000ms)
+  -> runs haproxy -c -f /etc/haproxy/conf.d (validation, timeout: 30000ms)
   -> records current worker PIDs
-  -> os.kill(haproxy_master_pid, signal.SIGUSR2)
+  -> process.kill(haproxy_master_pid, 'SIGUSR2')
   -> polls for new worker PIDs (200ms interval, 10s timeout)
   -> confirms reload succeeded (new workers spawned)
   -> returns 201 to client
@@ -778,23 +779,28 @@ Or simply: since HAProxy in master-worker mode with `-W` writes its PID, use `pg
 
 Recommended approach for the API:
 
-```python
-def get_haproxy_master_pid():
-    """Find HAProxy master PID by looking for the process with PPID 1."""
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            status = (pid_dir / "status").read_text()
-            if "haproxy" in (pid_dir / "comm").read_text():
-                for line in status.splitlines():
-                    if line.startswith("PPid:"):
-                        ppid = int(line.split()[1])
-                        if ppid == 0 or ppid == 1:
-                            return int(pid_dir.name)
-        except (FileNotFoundError, PermissionError):
-            continue
-    return None
+```javascript
+import { readdirSync, readFileSync } from 'node:fs';
+
+function getHaproxyMasterPid() {
+    /** Find HAProxy master PID by looking for the process with PPID 1. */
+    for (const entry of readdirSync('/proc')) {
+        if (!/^\d+$/.test(entry)) continue;
+        try {
+            const comm = readFileSync(`/proc/${entry}/comm`, 'utf8').trim();
+            if (comm !== 'haproxy') continue;
+            const status = readFileSync(`/proc/${entry}/status`, 'utf8');
+            const ppidLine = status.split('\n').find(l => l.startsWith('PPid:'));
+            if (ppidLine) {
+                const ppid = parseInt(ppidLine.split(/\s+/)[1], 10);
+                if (ppid === 0 || ppid === 1) return parseInt(entry, 10);
+            }
+        } catch {
+            continue;
+        }
+    }
+    return null;
+}
 ```
 
 ### 5.4 Master CLI Socket (Optional Enhancement)
@@ -969,9 +975,9 @@ networks:
 ```dockerfile
 FROM haproxy:lts
 
-# Install Python 3 (for the API) and procps (for process management)
+# Install Node.js (for the API) and procps (for process management)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 procps && \
+    apt-get install -y --no-install-recommends nodejs npm procps && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy config generation tools
@@ -979,7 +985,7 @@ COPY generate-config.sh /usr/local/bin/generate-config.sh
 COPY templates/ /usr/local/share/haproxy/templates/
 
 # Copy the registration API
-COPY registration-api.py /usr/local/bin/registration-api.py
+COPY registration-api.mjs /usr/local/bin/registration-api.mjs
 
 # Copy entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -1124,32 +1130,44 @@ The Registration API does NOT validate that a container exists or is reachable d
 
 ### 8.3 Concurrent API Requests
 
-File locking (`fcntl.flock`) ensures that concurrent `POST` and `DELETE` requests are serialized. The lock is acquired with a non-blocking polling loop and a 60-second deadline to prevent unbounded waits:
+File locking ensures that concurrent `POST` and `DELETE` requests are serialized. Since Node.js does not have native `fcntl` advisory lock bindings without npm packages, the API uses a lock file approach with `O_EXCL | O_CREAT` (which atomically fails if the lock file already exists) and a polling loop with a 60-second deadline:
 
-```python
-deadline = time.time() + 60
-while True:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except BlockingIOError:
-        if time.time() > deadline:
-            raise TimeoutError("Lock held too long")
-        time.sleep(0.5)
+```javascript
+import { openSync, closeSync, unlinkSync, constants } from 'node:fs';
+
+async function acquireLock(lockPath, deadlineMs = 60000) {
+    const deadline = Date.now() + deadlineMs;
+    while (true) {
+        try {
+            // O_EXCL | O_CREAT fails if lock file already exists
+            const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+            return fd; // Lock acquired
+        } catch (err) {
+            if (err.code !== 'EEXIST') throw err;
+            if (Date.now() > deadline) throw new Error('Lock acquisition timeout');
+            await new Promise(r => setTimeout(r, 500));
+        }
+    }
+}
+
+function releaseLock(fd, lockPath) {
+    closeSync(fd);
+    unlinkSync(lockPath);
+}
 ```
 
 The lock acquisition timestamp is tracked. The health check endpoint (Section 2.3.6) reports `"status": "degraded"` if the lock has been held for more than 30 seconds, indicating a potential stuck operation.
 
 Subprocess calls within the critical section are also bounded:
 
-- `generate-config.sh` is called with `subprocess.run(..., timeout=30)`.
-- `haproxy -c` (config validation) is called with `subprocess.run(..., timeout=30)`.
+- `generate-config.sh` is called with `child_process.execFile` with `timeout: 30000`.
+- `haproxy -c` (config validation) is called with `child_process.execFile` with `timeout: 30000`.
 
-If the API process crashes while holding the lock, the OS releases the lock automatically (file locks in Linux are process-scoped).
+If the Node.js API process crashes while holding the lock, the lock file remains on disk (unlike `fcntl` advisory locks which are process-scoped). The entrypoint's restart loop handles this by cleaning up stale lock files on API startup: the API checks the lock file's age on startup and removes it if it is older than 120 seconds (indicating a crashed previous instance rather than an active lock holder).
 
 ### 8.4 API Process Crash
 
-If the Python API process crashes:
+If the Node.js API process crashes:
 
 - HAProxy continues to serve traffic with the last valid configuration.
 - The entrypoint's restart loop automatically restarts the API process with exponential backoff (starting at 2 seconds, doubling up to 60 seconds; see Section 3.4). If the API ran for more than 60 seconds before crashing, the backoff and failure counter reset (the crash is considered transient). After 10 consecutive failures (each lasting less than 60 seconds), the restart loop stops to avoid masking a persistent error. The restart loop PID (`API_LOOP_PID`) is tracked and cleaned up via the entrypoint's trap handler on container shutdown.
@@ -1270,8 +1288,8 @@ The domain and container validation patterns are restrictive by design. They rej
 
 `generate-config.sh` reads `domains.map` via `read -r` and substitutes values into HAProxy config using heredocs. The input validation in Section 10.3 ensures that no shell-special characters can appear in the fields. Additionally:
 
-- The API writes `domains.map` using Python's file I/O, not shell commands.
-- `generate-config.sh` is invoked via `subprocess.run()` with no shell interpolation of user inputs.
+- The API writes `domains.map` using Node.js file I/O, not shell commands.
+- `generate-config.sh` is invoked via `child_process.execFile()` with no shell interpolation of user inputs.
 
 ### 10.5 Denial of Service
 
@@ -1292,7 +1310,7 @@ An attacker on `haproxy-net` could:
   1. Request arrives, acquires file lock on `domains.map`.
   2. Write changes to `domains.map`.
   3. Release file lock (so other requests are not blocked during the debounce window).
-  4. Start/reset a 2-second debounce timer via `threading.Timer(2.0, do_reload)`.
+  4. Start/reset a 2-second debounce timer via `setTimeout(doReload, 2000)` (cancelling any pending timer with `clearTimeout`).
   5. If a subsequent write arrives before the timer fires, the pending timer is cancelled and a new 2-second timer is started.
   6. When the timer fires, re-acquire the file lock, run `generate-config.sh`, validate config with `haproxy -c`, send `SIGUSR2` to HAProxy, then release the lock.
   7. The API tracks the pending reload state so that `POST` requests that triggered a debounced reload can block until the reload completes (see Section 5.7).
@@ -1373,7 +1391,7 @@ curl -s -X POST http://haproxy:8404/v1/backends \
 curl -s http://haproxy:8404/v1/backends
 
 # List all backends (pretty-printed)
-curl -s http://haproxy:8404/v1/backends | python3 -m json.tool
+curl -s http://haproxy:8404/v1/backends | jq .
 
 # Get a specific backend
 curl -s http://haproxy:8404/v1/backends/app.example.com
