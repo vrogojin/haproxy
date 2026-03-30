@@ -1,18 +1,23 @@
 services:
   haproxy:
-    image: haproxy:lts
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: haproxy
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
       - "8000:8000"
+      - "50001-50004:50001-50004"
+      # Port 8404 is NOT published -- API is internal only
     volumes:
-      - ./conf.d:/usr/local/etc/haproxy/conf.d:ro
-      - ./maps:/usr/local/etc/haproxy/maps:ro
-    command: haproxy -f /usr/local/etc/haproxy/conf.d
+      - haproxy-data:/etc/haproxy
     networks:
       - haproxy-net
+
+volumes:
+  haproxy-data:
 
 networks:
   haproxy-net:
