@@ -363,11 +363,20 @@ function scheduleReload() {
             debounceTimer = null;
             const resolvers = debounceResolvers.splice(0);
             try {
+                // Snapshot current domains.map before regeneration for rollback
+                let backupContent = null;
+                try {
+                    if (existsSync(DOMAINS_MAP)) {
+                        backupContent = readFileSync(DOMAINS_MAP, 'utf8');
+                    }
+                } catch {}
+
                 await regenerateConfig();
                 await validateConfig();
                 await reloadHAProxy();
                 resolvers.forEach(r => r.resolve());
             } catch (err) {
+                console.error('[registration-api] Debounced reload failed:', err.message);
                 resolvers.forEach(r => r.reject(err));
             }
         }, 2000);
@@ -618,7 +627,7 @@ async function handleRegister(req, res) {
         if (existingIdx !== -1) {
             const existing = entries[existingIdx];
             if (entriesMatch(existing, newEntry)) {
-                // Idempotent match
+                // Idempotent match — no changes needed
                 releaseLock();
                 lockHeld = false;
                 const registrations = readRegistrations();
@@ -626,7 +635,46 @@ async function handleRegister(req, res) {
                 resp.message = 'Already registered with identical configuration';
                 return sendJson(res, 200, resp);
             }
-            // Conflict: same domain, different config
+            if (existing.container === newEntry.container) {
+                // Same container, different config — update the registration
+                entries[existingIdx] = newEntry;
+                const updatedLines = [];
+                const rawLines = (existsSync(DOMAINS_MAP) ? readFileSync(DOMAINS_MAP, 'utf8') : '').split('\n');
+                for (const rawLine of rawLines) {
+                    const trimmed = rawLine.trim();
+                    if (!trimmed || trimmed.startsWith('#')) {
+                        updatedLines.push(rawLine);
+                        continue;
+                    }
+                    const parts = trimmed.split(/\s+/);
+                    if (parts[0] === newEntry.domain) {
+                        updatedLines.push(entryToMapLine(newEntry));
+                    } else {
+                        updatedLines.push(rawLine);
+                    }
+                }
+                writeDomainsMap(updatedLines.join('\n'));
+
+                const registrations = readRegistrations();
+                releaseLock();
+                lockHeld = false;
+
+                // Schedule debounced reload
+                try {
+                    await scheduleReload();
+                } catch (reloadErr) {
+                    console.error('[registration-api] Reload after update failed:', reloadErr.message);
+                    return sendJson(res, 500, {
+                        error: `HAProxy reload failed: ${reloadErr.message}`,
+                        code: 'RELOAD_FAILED'
+                    });
+                }
+
+                const resp = entryToResponse(newEntry, registrations);
+                resp.message = 'Registration updated';
+                return sendJson(res, 200, resp);
+            }
+            // Different container — conflict
             releaseLock();
             lockHeld = false;
             const registrations = readRegistrations();
@@ -657,28 +705,12 @@ async function handleRegister(req, res) {
         releaseLock();
         lockHeld = false;
 
-        // Schedule debounced reload
+        // Schedule debounced reload — no per-request rollback after lock release;
+        // the debounce handler manages its own recovery.
         try {
             await scheduleReload();
         } catch (reloadErr) {
-            // Reload failed — attempt rollback
-            console.error('[registration-api] Reload failed, rolling back:', reloadErr.message);
-            try {
-                await acquireLock(10000);
-                lockHeld = true;
-                writeDomainsMap(backupContent);
-                // Remove metadata for the failed registration
-                delete registrations[newEntry.domain];
-                writeRegistrations(registrations);
-                try {
-                    await regenerateConfig();
-                } catch {}
-                releaseLock();
-                lockHeld = false;
-            } catch (rollbackErr) {
-                console.error('[registration-api] Rollback failed:', rollbackErr.message);
-                if (lockHeld) { releaseLock(); lockHeld = false; }
-            }
+            console.error('[registration-api] Reload failed:', reloadErr.message);
             return sendJson(res, 500, {
                 error: `HAProxy reload failed: ${reloadErr.message}`,
                 code: 'RELOAD_FAILED'
@@ -777,22 +809,11 @@ async function handleDelete(req, res, domain) {
         releaseLock();
         lockHeld = false;
 
-        // Schedule debounced reload
+        // Schedule debounced reload — no per-request rollback after lock release
         try {
             await scheduleReload();
         } catch (reloadErr) {
-            console.error('[registration-api] Reload after delete failed, rolling back:', reloadErr.message);
-            try {
-                await acquireLock(10000);
-                lockHeld = true;
-                writeDomainsMap(backupContent);
-                try { await regenerateConfig(); } catch {}
-                releaseLock();
-                lockHeld = false;
-            } catch (rollbackErr) {
-                console.error('[registration-api] Rollback failed:', rollbackErr.message);
-                if (lockHeld) { releaseLock(); lockHeld = false; }
-            }
+            console.error('[registration-api] Reload after delete failed:', reloadErr.message);
             return sendJson(res, 500, {
                 error: `HAProxy reload failed: ${reloadErr.message}`,
                 code: 'RELOAD_FAILED'

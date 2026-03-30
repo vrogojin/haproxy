@@ -831,8 +831,9 @@ suite_reload_under_load() {
 
         wait $loader_pid 2>/dev/null || true
 
-        local fail_count
-        fail_count=$(grep -cv "200" "$results_file" 2>/dev/null || echo "0")
+        local success_count fail_count
+        success_count=$(grep -cx "200" "$results_file" 2>/dev/null || echo "0")
+        fail_count=$((total_requests - success_count))
         assert_equals "0" "$fail_count" "Zero requests should fail during reload"
 
         # Cleanup: remove the test domain

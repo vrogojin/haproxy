@@ -1,7 +1,7 @@
 FROM haproxy:lts
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends nodejs npm procps curl socat && \
+    apt-get install -y --no-install-recommends nodejs procps curl socat && \
     rm -rf /var/lib/apt/lists/*
 
 # Config generation tools

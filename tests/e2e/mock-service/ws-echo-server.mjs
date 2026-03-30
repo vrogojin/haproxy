@@ -68,12 +68,24 @@ function handleUpgrade(req, socket) {
             payload[i] = masked ? buf[offset + i] ^ maskKey[i % 4] : buf[offset + i];
         }
 
-        // Send echo frame (unmasked, text)
-        const frame = Buffer.alloc(2 + payloadLen);
-        frame[0] = 0x81; // FIN + text
-        frame[1] = payloadLen; // no mask, assume < 126 bytes
-        payload.copy(frame, 2);
-        socket.write(frame);
+        // Send echo frame (unmasked, text) with extended payload length support
+        let header;
+        if (payloadLen < 126) {
+            header = Buffer.alloc(2);
+            header[0] = 0x81; // FIN + text
+            header[1] = payloadLen;
+        } else if (payloadLen < 65536) {
+            header = Buffer.alloc(4);
+            header[0] = 0x81;
+            header[1] = 126;
+            header.writeUInt16BE(payloadLen, 2);
+        } else {
+            header = Buffer.alloc(10);
+            header[0] = 0x81;
+            header[1] = 127;
+            header.writeBigUInt64BE(BigInt(payloadLen), 2);
+        }
+        socket.write(Buffer.concat([header, payload]));
     });
 
     socket.on('error', () => {});

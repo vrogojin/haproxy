@@ -77,6 +77,13 @@ mkdir -p "$CONF_DIR" "$MAPS_DIR"
 cp "${TEMPLATES_DIR}/00-global.cfg" "${TEMPLATES_DIR}/10-frontends.cfg" "${CONF_DIR}/"
 
 # ---------------------------------------------------------------------------
+# Clean stale extra port files from previous runs
+# ---------------------------------------------------------------------------
+
+rm -f "${CONF_DIR}/30-extra-frontends.cfg"
+rm -f "${MAPS_DIR}"/extra-*-domains.map
+
+# ---------------------------------------------------------------------------
 # Initialize generated files
 # ---------------------------------------------------------------------------
 
@@ -125,6 +132,16 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     # Validate we have required fields
     if [[ -z "$domain" || -z "$container" || -z "$http_port" || -z "$https_port" ]]; then
         echo "Warning: Skipping invalid line: $line"
+        continue
+    fi
+
+    # Validate fields (defense-in-depth — API should have validated already)
+    if [[ ! "$domain" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]; then
+        echo "Warning: Skipping invalid domain: $domain" >&2
+        continue
+    fi
+    if [[ ! "$container" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+        echo "Warning: Skipping invalid container: $container" >&2
         continue
     fi
 
