@@ -51,7 +51,6 @@ The clean room guarantee is three-fold:
 - **Production HAProxy**: The test HAProxy container is completely independent.
 - **Performance at scale**: These are functional correctness tests. Load testing is a separate effort.
 - **HAProxy Runtime API**: Stats, drain, admin sockets are out of scope.
-- **API key authentication** (`HAPROXY_API_KEY`): Tested as a unit concern, not E2E.
 
 ---
 
@@ -100,12 +99,21 @@ Every Docker resource created by the test harness uses the prefix `haproxy-e2e-t
 All container ports are published with `-p 0:<container_port>`, letting Docker assign random high ports on the host. The test harness discovers assigned ports via `docker port`:
 
 ```bash
-HTTP_PORT=$(docker port haproxy-e2e-test-proxy 80/tcp | head -1 | cut -d: -f2)
-HTTPS_PORT=$(docker port haproxy-e2e-test-proxy 443/tcp | head -1 | cut -d: -f2)
-API_PORT=$(docker port haproxy-e2e-test-proxy 8404/tcp | head -1 | cut -d: -f2)
-EXTRA_TCP_PORT=$(docker port haproxy-e2e-test-proxy 50001/tcp | head -1 | cut -d: -f2)
-EXTRA_HTTP_PORT=$(docker port haproxy-e2e-test-proxy 50003/tcp | head -1 | cut -d: -f2)
-EXTRA_TLS_PORT=$(docker port haproxy-e2e-test-proxy 50004/tcp | head -1 | cut -d: -f2)
+HTTP_PORT=$(docker port haproxy-e2e-test-proxy 80/tcp | head -1 | sed 's/.*://')
+HTTPS_PORT=$(docker port haproxy-e2e-test-proxy 443/tcp | head -1 | sed 's/.*://')
+API_PORT=$(docker port haproxy-e2e-test-proxy 8404/tcp | head -1 | sed 's/.*://')
+EXTRA_TCP_PORT=$(docker port haproxy-e2e-test-proxy 50001/tcp | head -1 | sed 's/.*://')
+EXTRA_HTTP_PORT=$(docker port haproxy-e2e-test-proxy 50003/tcp | head -1 | sed 's/.*://')
+EXTRA_TLS_PORT=$(docker port haproxy-e2e-test-proxy 50004/tcp | head -1 | sed 's/.*://')
+
+# Guard: verify all ports were discovered
+for var in HTTP_PORT HTTPS_PORT API_PORT EXTRA_TCP_PORT EXTRA_HTTP_PORT EXTRA_TLS_PORT; do
+    if [ -z "${!var:-}" ]; then
+        echo "FATAL: Failed to discover port for ${var}. Container may have crashed." >&2
+        docker logs "${TEST_HAPROXY}" 2>&1 | tail -20
+        exit 1
+    fi
+done
 ```
 
 This eliminates any possibility of port conflicts with production services.
@@ -399,7 +407,12 @@ clean_room() {
         echo "$containers" | xargs docker rm -f 2>/dev/null || true
     fi
 
-    # Remove test network (may fail if containers are still connected)
+    # Disconnect any containers still on the test network
+    for cid in $(docker network inspect "${TEST_PREFIX}-net" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null); do
+        docker network disconnect -f "${TEST_PREFIX}-net" "$cid" 2>/dev/null || true
+    done
+
+    # Remove test network
     docker network rm "${TEST_PREFIX}-net" 2>/dev/null || true
 
     # Remove test volumes (none expected, but defensive)
@@ -409,6 +422,9 @@ clean_room() {
         echo "  Removing volumes: $volumes"
         echo "$volumes" | xargs docker volume rm 2>/dev/null || true
     fi
+
+    # Remove test images (not cached for speed -- ensures clean builds)
+    docker rmi "${TEST_IMAGE}" "${HAPROXY_IMAGE}" 2>/dev/null || true
 
     # Clean up temp files
     rm -f /tmp/${TEST_PREFIX}-* 2>/dev/null || true
@@ -754,7 +770,20 @@ test_domain_conflict() {
 }
 ```
 
-#### Test 3.8: Mode Conflict on Extra Port (409 MODE_CONFLICT)
+#### Test 3.8: Same Domain, Different Ports (409 Conflict)
+
+```bash
+test_port_conflict() {
+    # Same domain, same container, different ports → 409
+    local code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST "http://${TEST_HAPROXY}:8404/v1/backends" \
+        -H "Content-Type: application/json" \
+        -d '{"domain":"web.test.local","container":"'${TEST_WEB}'","http_port":8080,"https_port":443}')
+    assert_equals "409" "$code" "Same domain, different ports should return 409"
+}
+```
+
+#### Test 3.9: Mode Conflict on Extra Port (409 MODE_CONFLICT)
 
 ```bash
 test_mode_conflict() {
@@ -1192,13 +1221,35 @@ test_wss_50004() {
 
 #### Test 8.1: Delete Web Backend (204 No Content)
 
+DELETE must originate from the same container that registered the domain (ownership verification via source IP).
+
 ```bash
 test_delete_web() {
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-        "http://127.0.0.1:${API_PORT}/v1/backends/web.test.local")
+    http_code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" -X DELETE \
+        "http://${TEST_HAPROXY}:8404/v1/backends/web.test.local")
 
     assert_equals "204" "$http_code" "DELETE should return 204 No Content"
+}
+```
+
+#### Test 8.1b: DELETE from Host Returns 403 (Ownership Mismatch)
+
+A host-originated DELETE comes from the Docker bridge gateway IP, not the container's IP. It should fail ownership verification.
+
+```bash
+test_delete_from_host_403() {
+    # First register a domain for this test
+    curl -s -X POST "http://127.0.0.1:${API_PORT}/v1/backends" \
+        -H "Content-Type: application/json" \
+        -d '{"domain":"api.test.local","container":"'"${TEST_API}"'","http_port":8080,"https_port":8443}' > /dev/null
+
+    # Test: DELETE from host should fail ownership check
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+        "http://127.0.0.1:${API_PORT}/v1/backends/api.test.local")
+
+    assert_equals "403" "$http_code" "DELETE from host should return 403 OWNERSHIP_MISMATCH"
 }
 ```
 
@@ -1858,6 +1909,94 @@ test_ownership_domain_removed() {
 
 ---
 
+### Suite 13: Authentication and Rate Limiting
+
+**Purpose:** Verify that `HAPROXY_API_KEY` enforces Bearer token authentication and that `MAX_REGISTRATIONS` limits the number of backends a single source can register.
+
+These tests spin up separate HAProxy containers with specific environment variables, isolated from the main test proxy.
+
+#### Test 13.1: MAX_REGISTRATIONS Limit
+
+```bash
+test_max_registrations() {
+    # Start a separate HAProxy with MAX_REGISTRATIONS=3
+    docker run -d --name "${TEST_PREFIX}-limit-proxy" \
+        --network "${TEST_NET}" \
+        -e MAX_REGISTRATIONS=3 \
+        "${HAPROXY_IMAGE}"
+    wait_for_healthy "${TEST_PREFIX}-limit-proxy" 30
+
+    local limit_api="${TEST_PREFIX}-limit-proxy:8404"
+
+    # Register 3 backends — should all succeed
+    for i in 1 2 3; do
+        local code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+            -X POST "http://${limit_api}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d "{\"domain\":\"limit${i}.test.local\",\"container\":\"${TEST_WEB}\",\"http_port\":80,\"https_port\":443}")
+        assert_equals "201" "$code" "Registration ${i}/3 should succeed"
+    done
+
+    # 4th registration — should fail with 429
+    local code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST "http://${limit_api}/v1/backends" \
+        -H "Content-Type: application/json" \
+        -d '{"domain":"limit4.test.local","container":"'${TEST_WEB}'","http_port":80,"https_port":443}')
+    assert_equals "429" "$code" "4th registration should hit MAX_REGISTRATIONS limit"
+
+    # Cleanup
+    docker rm -f "${TEST_PREFIX}-limit-proxy" >/dev/null 2>&1
+}
+```
+
+#### Test 13.2: HAPROXY_API_KEY Authentication
+
+```bash
+test_api_key_auth() {
+    # Start a separate HAProxy with API key
+    docker run -d --name "${TEST_PREFIX}-auth-proxy" \
+        --network "${TEST_NET}" \
+        -e HAPROXY_API_KEY="test-secret-key-12345" \
+        "${HAPROXY_IMAGE}"
+    wait_for_healthy "${TEST_PREFIX}-auth-proxy" 30
+
+    local auth_api="${TEST_PREFIX}-auth-proxy:8404"
+
+    # Unauthenticated POST — should return 401
+    local code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST "http://${auth_api}/v1/backends" \
+        -H "Content-Type: application/json" \
+        -d '{"domain":"auth.test.local","container":"'${TEST_WEB}'","http_port":80,"https_port":443}')
+    assert_equals "401" "$code" "Unauthenticated POST should return 401"
+
+    # Authenticated POST — should return 201
+    local code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST "http://${auth_api}/v1/backends" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer test-secret-key-12345" \
+        -d '{"domain":"auth.test.local","container":"'${TEST_WEB}'","http_port":80,"https_port":443}')
+    assert_equals "201" "$code" "Authenticated POST should return 201"
+
+    # Wrong key — should return 401
+    local code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+        -X POST "http://${auth_api}/v1/backends" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer wrong-key" \
+        -d '{"domain":"auth2.test.local","container":"'${TEST_WEB}'","http_port":80,"https_port":443}')
+    assert_equals "401" "$code" "Wrong API key should return 401"
+
+    # Health endpoint — should be exempt from auth
+    local code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+        "http://${auth_api}/v1/health")
+    assert_equals "200" "$code" "Health endpoint should be exempt from auth"
+
+    # Cleanup
+    docker rm -f "${TEST_PREFIX}-auth-proxy" >/dev/null 2>&1
+}
+```
+
+---
+
 ## 6. Test Runner
 
 ### 6.1 Complete Script Structure
@@ -2021,6 +2160,11 @@ clean_room() {
         echo "$containers" | xargs docker rm -f 2>/dev/null || true
     fi
 
+    # Disconnect any containers still on the test network
+    for cid in $(docker network inspect "${TEST_NET}" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null); do
+        docker network disconnect -f "${TEST_NET}" "$cid" 2>/dev/null || true
+    done
+
     # Remove test network
     docker network rm "${TEST_NET}" 2>/dev/null || true
 
@@ -2031,6 +2175,9 @@ clean_room() {
         echo "  Removing volumes..."
         echo "$volumes" | xargs docker volume rm 2>/dev/null || true
     fi
+
+    # Remove test images (not cached for speed -- ensures clean builds)
+    docker rmi "${TEST_IMAGE}" "${HAPROXY_IMAGE}" 2>/dev/null || true
 
     # Clean up temp files
     rm -f /tmp/${TEST_PREFIX}-* 2>/dev/null || true
@@ -2133,12 +2280,21 @@ start_environment() {
     wait_for_healthy "${TEST_HAPROXY}" 30
 
     # Discover published ports
-    HTTP_PORT=$(docker port "${TEST_HAPROXY}" 80/tcp | head -1 | cut -d: -f2)
-    HTTPS_PORT=$(docker port "${TEST_HAPROXY}" 443/tcp | head -1 | cut -d: -f2)
-    API_PORT=$(docker port "${TEST_HAPROXY}" 8404/tcp | head -1 | cut -d: -f2)
-    EXTRA_TCP_PORT=$(docker port "${TEST_HAPROXY}" 50001/tcp | head -1 | cut -d: -f2)
-    EXTRA_HTTP_PORT=$(docker port "${TEST_HAPROXY}" 50003/tcp | head -1 | cut -d: -f2)
-    EXTRA_TLS_PORT=$(docker port "${TEST_HAPROXY}" 50004/tcp | head -1 | cut -d: -f2)
+    HTTP_PORT=$(docker port "${TEST_HAPROXY}" 80/tcp | head -1 | sed 's/.*://')
+    HTTPS_PORT=$(docker port "${TEST_HAPROXY}" 443/tcp | head -1 | sed 's/.*://')
+    API_PORT=$(docker port "${TEST_HAPROXY}" 8404/tcp | head -1 | sed 's/.*://')
+    EXTRA_TCP_PORT=$(docker port "${TEST_HAPROXY}" 50001/tcp | head -1 | sed 's/.*://')
+    EXTRA_HTTP_PORT=$(docker port "${TEST_HAPROXY}" 50003/tcp | head -1 | sed 's/.*://')
+    EXTRA_TLS_PORT=$(docker port "${TEST_HAPROXY}" 50004/tcp | head -1 | sed 's/.*://')
+
+    # Guard: verify all ports were discovered
+    for var in HTTP_PORT HTTPS_PORT API_PORT EXTRA_TCP_PORT EXTRA_HTTP_PORT EXTRA_TLS_PORT; do
+        if [ -z "${!var:-}" ]; then
+            echo "FATAL: Failed to discover port for ${var}. Container may have crashed." >&2
+            docker logs "${TEST_HAPROXY}" 2>&1 | tail -20
+            exit 1
+        fi
+    done
 
     echo "  Published ports:"
     echo "    HTTP:       ${HTTP_PORT}"
@@ -2324,6 +2480,16 @@ suite_registration() {
         assert_equals "DOMAIN_CONFLICT" "$(echo "$body" | jq -r '.code')" "Error code should be DOMAIN_CONFLICT"
     }
     run_test "Domain conflict detection (409)" test_domain_conflict
+
+    test_port_conflict() {
+        local code
+        code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+            -X POST "http://${TEST_HAPROXY}:8404/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d '{"domain":"web.test.local","container":"'"${TEST_WEB}"'","http_port":8080,"https_port":443}')
+        assert_equals "409" "$code" "Same domain, different ports should return 409"
+    }
+    run_test "Same domain, different ports returns 409" test_port_conflict
 
     test_mode_conflict() {
         local response http_code
@@ -2574,11 +2740,20 @@ suite_unregistration() {
 
     test_delete_web() {
         local http_code
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-            "http://127.0.0.1:${API_PORT}/v1/backends/web.test.local")
+        http_code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" -X DELETE \
+            "http://${TEST_HAPROXY}:8404/v1/backends/web.test.local")
         assert_equals "204" "$http_code" "DELETE should return 204"
     }
     run_test "Delete web.test.local returns 204" test_delete_web
+
+    test_delete_from_host_403() {
+        # DELETE from host should fail ownership check (source IP is gateway, not container)
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            "http://127.0.0.1:${API_PORT}/v1/backends/api.test.local")
+        assert_equals "403" "$http_code" "DELETE from host should return 403 OWNERSHIP_MISMATCH"
+    }
+    run_test "DELETE from host returns 403 (ownership mismatch)" test_delete_from_host_403
 
     sleep 2  # Allow HAProxy reload
 
@@ -2953,6 +3128,81 @@ suite_container_ownership() {
     run_test "Domain removed after owner DELETE" test_ownership_domain_removed
 }
 
+suite_auth_and_rate_limiting() {
+    run_suite "13. Authentication and Rate Limiting"
+
+    test_max_registrations() {
+        docker run -d --name "${TEST_PREFIX}-limit-proxy" \
+            --network "${TEST_NET}" \
+            -e MAX_REGISTRATIONS=3 \
+            "${HAPROXY_IMAGE}"
+        wait_for_healthy "${TEST_PREFIX}-limit-proxy" 30
+
+        local limit_api="${TEST_PREFIX}-limit-proxy:8404"
+
+        for i in 1 2 3; do
+            local code
+            code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+                -X POST "http://${limit_api}/v1/backends" \
+                -H "Content-Type: application/json" \
+                -d "{\"domain\":\"limit${i}.test.local\",\"container\":\"${TEST_WEB}\",\"http_port\":80,\"https_port\":443}")
+            assert_equals "201" "$code" "Registration ${i}/3 should succeed"
+        done
+
+        local code
+        code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+            -X POST "http://${limit_api}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d "{\"domain\":\"limit4.test.local\",\"container\":\"${TEST_WEB}\",\"http_port\":80,\"https_port\":443}")
+        assert_equals "429" "$code" "4th registration should hit MAX_REGISTRATIONS limit"
+
+        docker rm -f "${TEST_PREFIX}-limit-proxy" >/dev/null 2>&1
+    }
+    run_test "MAX_REGISTRATIONS=3 blocks 4th registration (429)" test_max_registrations
+
+    test_api_key_auth() {
+        docker run -d --name "${TEST_PREFIX}-auth-proxy" \
+            --network "${TEST_NET}" \
+            -e HAPROXY_API_KEY="test-secret-key-12345" \
+            "${HAPROXY_IMAGE}"
+        wait_for_healthy "${TEST_PREFIX}-auth-proxy" 30
+
+        local auth_api="${TEST_PREFIX}-auth-proxy:8404"
+
+        # Unauthenticated POST
+        local code
+        code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+            -X POST "http://${auth_api}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d '{"domain":"auth.test.local","container":"'"${TEST_WEB}"'","http_port":80,"https_port":443}')
+        assert_equals "401" "$code" "Unauthenticated POST should return 401"
+
+        # Authenticated POST
+        code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+            -X POST "http://${auth_api}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer test-secret-key-12345" \
+            -d '{"domain":"auth.test.local","container":"'"${TEST_WEB}"'","http_port":80,"https_port":443}')
+        assert_equals "201" "$code" "Authenticated POST should return 201"
+
+        # Wrong key
+        code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+            -X POST "http://${auth_api}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer wrong-key" \
+            -d '{"domain":"auth2.test.local","container":"'"${TEST_WEB}"'","http_port":80,"https_port":443}')
+        assert_equals "401" "$code" "Wrong API key should return 401"
+
+        # Health exempt from auth
+        code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
+            "http://${auth_api}/v1/health")
+        assert_equals "200" "$code" "Health endpoint should be exempt from auth"
+
+        docker rm -f "${TEST_PREFIX}-auth-proxy" >/dev/null 2>&1
+    }
+    run_test "HAPROXY_API_KEY enforces Bearer auth (401/201)" test_api_key_auth
+}
+
 # ─── Main ──────────────────────────────────────────────────────
 
 main() {
@@ -2983,13 +3233,15 @@ main() {
         suite_error_handling
         suite_concurrent_registration
         suite_container_ownership
+        suite_auth_and_rate_limiting
     else
         "suite_${target_suite}" 2>/dev/null || {
             echo "Unknown suite: ${target_suite}" >&2
             echo "Available suites: clean_room, haproxy_startup, registration," >&2
             echo "  http_routing, tls_passthrough, extra_ports, websocket," >&2
             echo "  unregistration, reload_under_load, error_handling," >&2
-            echo "  concurrent_registration, container_ownership" >&2
+            echo "  concurrent_registration, container_ownership," >&2
+            echo "  auth_and_rate_limiting" >&2
             exit 1
         }
     fi
@@ -3173,8 +3425,9 @@ The E2E suite should complete in under 3 minutes on GitHub Actions `ubuntu-lates
 | Suite 9 (reload under load) | ~10s |
 | Suite 10 (error handling) | ~5s |
 | Suite 11-12 (concurrent, ownership) | ~10s |
+| Suite 13 (auth, rate limiting) | ~15s |
 | Cleanup | ~5s |
-| **Total** | **~115s** |
+| **Total** | **~130s** |
 
 ### 7.3 Caching Strategy
 
@@ -3319,17 +3572,18 @@ The test suite is designed for Linux (GitHub Actions `ubuntu-latest`). On macOS:
 |---|---|---|
 | 1. Clean Room | 3 | Infrastructure |
 | 2. HAProxy Startup | 4 | Infrastructure |
-| 3. Registration | 8 | API |
+| 3. Registration | 9 | API |
 | 4. HTTP Routing | 5 | Routing |
 | 5. TLS Passthrough | 4 | Routing |
 | 6. Extra Ports | 4 | Routing |
 | 7. WebSocket | 3 | Routing |
-| 8. Unregistration | 7 | API + Routing |
+| 8. Unregistration | 8 | API + Routing |
 | 9. Reload Under Load | 1 | Reliability |
 | 10. Error Handling | 15 | API |
 | 11. Concurrent Registration | 2 | Concurrency |
 | 12. Container Ownership | 3 | Security |
-| **Total** | **59** | |
+| 13. Auth and Rate Limiting | 2 | Security |
+| **Total** | **63** | |
 
 ## Appendix B: File Layout
 
