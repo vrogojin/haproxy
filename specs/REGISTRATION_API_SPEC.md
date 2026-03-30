@@ -77,6 +77,7 @@ Error codes:
 | `UNAUTHORIZED` | Missing or invalid API key (when `HAPROXY_API_KEY` is set) |
 | `LIMIT_EXCEEDED` | Maximum registration count reached (`MAX_REGISTRATIONS`) |
 | `OWNERSHIP_MISMATCH` | DELETE request source IP does not match registered container |
+| `MODE_CONFLICT` | A registration already exists for this listen port with a different mode |
 | `INTERNAL_ERROR` | Unexpected server error |
 
 ### 2.3 Endpoints
@@ -477,6 +478,7 @@ The `extra_ports` field enables HAProxy to proxy traffic on non-standard ports. 
 - `mode` must be `"http"` or `"tcp"`
 - Maximum 10 extra ports per registration
 - The same `listen` port can be used by multiple domains (shared frontend with domain routing)
+- All registrations sharing the same `listen` port must use the same `mode`. If domain A registered `listen:50003` with `mode:"http"` and domain B attempts `listen:50003` with `mode:"tcp"`, the API returns 409 Conflict with error code `MODE_CONFLICT`.
 
 #### WebSocket Support
 
