@@ -35,6 +35,20 @@ readonly CONF_DIR="${HAPROXY_CONF_DIR:-./conf.d}"
 readonly MAPS_DIR="${HAPROXY_MAPS_DIR:-./maps}"
 readonly TEMPLATES_DIR="${HAPROXY_TEMPLATES_DIR:-./templates}"
 readonly DOMAINS_MAP="${HAPROXY_DOMAINS_MAP:-./domains.map}"
+readonly STATE_DIR="${HAPROXY_STATE_DIR:-./state}"
+
+# ---------------------------------------------------------------------------
+# File-level lock to prevent concurrent generate-config.sh executions
+# ---------------------------------------------------------------------------
+LOCK_FILE="${STATE_DIR}/generate-config.lock"
+mkdir -p "$STATE_DIR"
+
+exec 9>"$LOCK_FILE"
+if ! flock -w 30 9; then
+    echo "Error: Could not acquire lock (another generate-config.sh running?)" >&2
+    exit 1
+fi
+# Lock is held for the rest of the script (released automatically on exit)
 
 # ---------------------------------------------------------------------------
 # Validation

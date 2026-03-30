@@ -24,6 +24,7 @@ export HAPROXY_CONF_DIR="$CONF_DIR"
 export HAPROXY_MAPS_DIR="$MAPS_DIR"
 export HAPROXY_TEMPLATES_DIR="$TEMPLATES_DIR"
 export HAPROXY_DOMAINS_MAP="$DOMAINS_MAP"
+export HAPROXY_STATE_DIR="$STATE_DIR"
 
 # Generate initial config from domains.map
 echo "Generating initial HAProxy config..."

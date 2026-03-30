@@ -365,6 +365,16 @@ function scheduleReload() {
     });
 }
 
+function scheduleImmediateReload() {
+    return new Promise((resolve, reject) => {
+        debounceResolvers.push({ resolve, reject });
+        // Cancel any pending debounce — we're reloading now
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = null;
+        executeReload();
+    });
+}
+
 async function executeReload() {
     debounceTimer = null;
 
@@ -851,19 +861,13 @@ async function handleDelete(req, res, domain) {
 async function handleReload(req, res) {
     if (!checkAuth(req, res)) return;
 
-    let lockHeld = false;
     try {
-        await acquireLock();
-        lockHeld = true;
-
-        await regenerateConfig();
-        await validateConfig();
-        await reloadHAProxy();
+        // Use the same debounced reload path as registration/deletion.
+        // This ensures no concurrent generate-config.sh executions.
+        // Setting timeout to 0 triggers immediate reload (no debounce wait).
+        await scheduleImmediateReload();
 
         const { entries } = parseDomainsMap();
-
-        releaseLock();
-        lockHeld = false;
 
         return sendJson(res, 200, {
             message: 'Configuration regenerated and HAProxy reloaded',
@@ -871,7 +875,6 @@ async function handleReload(req, res) {
             reload_timestamp: new Date().toISOString()
         });
     } catch (err) {
-        if (lockHeld) releaseLock();
         console.error('[registration-api] Reload error:', err);
         return sendJson(res, 500, {
             error: `HAProxy configuration check failed: ${err.message}`,
