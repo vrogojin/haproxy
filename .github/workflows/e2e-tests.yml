@@ -1,0 +1,64 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'generate-config.sh'
+      - 'templates/**'
+      - 'Dockerfile'
+      - 'registration-api.mjs'
+      - 'entrypoint.sh'
+      - 'tests/e2e/**'
+      - '.github/workflows/e2e-tests.yml'
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq netcat-openbsd openssl
+
+      - name: Run E2E tests
+        run: |
+          chmod +x tests/e2e/run-tests.sh
+          ./tests/e2e/run-tests.sh
+        env:
+          DEBUG: ${{ runner.debug && '1' || '0' }}
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== HAProxy container logs ==="
+          docker logs haproxy-e2e-test-proxy 2>&1 || echo "Container not found"
+          echo ""
+          echo "=== Web container logs ==="
+          docker logs haproxy-e2e-test-web 2>&1 || echo "Container not found"
+          echo ""
+          echo "=== Electrum container logs ==="
+          docker logs haproxy-e2e-test-electrum 2>&1 || echo "Container not found"
+          echo ""
+          echo "=== API container logs ==="
+          docker logs haproxy-e2e-test-api 2>&1 || echo "Container not found"
+          echo ""
+          echo "=== Docker network inspect ==="
+          docker network inspect haproxy-e2e-test-net 2>&1 || echo "Network not found"
+          echo ""
+          echo "=== All docker containers ==="
+          docker ps -a --filter "name=haproxy-e2e-test" 2>&1
+
+      - name: Cleanup (safety net)
+        if: always()
+        run: |
+          docker ps -aq --filter "name=haproxy-e2e-test" 2>/dev/null | xargs -r docker rm -f || true
+          docker network rm haproxy-e2e-test-net 2>/dev/null || true
