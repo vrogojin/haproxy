@@ -550,7 +550,10 @@ async function verifyOwnership(req, containerName) {
         const addresses = await dnsResolve4(containerName);
         return addresses.includes(sourceIp);
     } catch {
-        return false;
+        // DNS resolution failed — the registered container is likely dead/removed.
+        // Allow the DELETE so new containers can take over stale domain registrations.
+        console.log(`[registration-api] Ownership check: container '${containerName}' not resolvable (dead?) — allowing operation`);
+        return true;
     }
 }
 
