@@ -427,8 +427,8 @@ suite_registration() {
     }
     run_test "Register api.test.local with non-standard ports (201)" test_register_api
 
-    # Allow time for HAProxy reload after registrations
-    sleep 2
+    # Allow time for debounce (2s) + config generation + HAProxy reload
+    sleep 5
 
     test_list_backends() {
         local response
@@ -475,15 +475,22 @@ suite_registration() {
     }
     run_test "Domain conflict detection (409)" test_domain_conflict
 
-    test_port_conflict() {
+    test_same_container_update() {
+        # Same domain, same container, different ports = UPDATE (200), not conflict
         local code
         code=$(docker exec "${TEST_WEB}" curl -sf -o /dev/null -w "%{http_code}" \
             -X POST "http://${TEST_HAPROXY}:8404/v1/backends" \
             -H "Content-Type: application/json" \
             -d '{"domain":"web.test.local","container":"'"${TEST_WEB}"'","http_port":8080,"https_port":443}')
-        assert_equals "409" "$code" "Same domain, different ports should return 409"
+        assert_equals "200" "$code" "Same container, different ports should return 200 (update)"
+        # Restore original registration to avoid breaking later tests
+        docker exec "${TEST_WEB}" curl -sf -o /dev/null \
+            -X POST "http://${TEST_HAPROXY}:8404/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d '{"domain":"web.test.local","container":"'"${TEST_WEB}"'","http_port":80,"https_port":443}'
+        sleep 3  # Wait for debounced reload after restore
     }
-    run_test "Same domain, different ports returns 409" test_port_conflict
+    run_test "Same container, different ports updates (200)" test_same_container_update
 
     test_mode_conflict() {
         local response http_code
@@ -749,7 +756,7 @@ suite_unregistration() {
     }
     run_test "DELETE from host returns 403 (ownership mismatch)" test_delete_from_host_403
 
-    sleep 2  # Allow HAProxy reload
+    sleep 5  # Allow debounce (2s) + config generation + HAProxy reload
 
     test_deleted_domain_503() {
         local http_code
@@ -793,7 +800,7 @@ suite_unregistration() {
     }
     run_test "Re-register deleted domain returns 201" test_reregister_web
 
-    sleep 2
+    sleep 5  # Allow debounce + reload
 
     test_reregistered_routes() {
         local response
