@@ -1,5 +1,8 @@
 FROM haproxy:lts
 
+# haproxy:lts sets USER haproxy — switch back to root for package install
+USER root
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs procps curl socat && \
     rm -rf /var/lib/apt/lists/*
