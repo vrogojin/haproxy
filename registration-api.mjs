@@ -354,33 +354,44 @@ async function reloadHAProxy() {
 
 let debounceTimer = null;
 let debounceResolvers = [];
+let reloadInProgress = false;
+let reloadQueued = false;
 
 function scheduleReload() {
     return new Promise((resolve, reject) => {
         debounceResolvers.push({ resolve, reject });
         if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(async () => {
-            debounceTimer = null;
-            const resolvers = debounceResolvers.splice(0);
-            try {
-                // Snapshot current domains.map before regeneration for rollback
-                let backupContent = null;
-                try {
-                    if (existsSync(DOMAINS_MAP)) {
-                        backupContent = readFileSync(DOMAINS_MAP, 'utf8');
-                    }
-                } catch {}
-
-                await regenerateConfig();
-                await validateConfig();
-                await reloadHAProxy();
-                resolvers.forEach(r => r.resolve());
-            } catch (err) {
-                console.error('[registration-api] Debounced reload failed:', err.message);
-                resolvers.forEach(r => r.reject(err));
-            }
-        }, 2000);
+        debounceTimer = setTimeout(() => executeReload(), 2000);
     });
+}
+
+async function executeReload() {
+    debounceTimer = null;
+
+    // If a reload is already in progress, queue another one for when it finishes
+    if (reloadInProgress) {
+        reloadQueued = true;
+        return;
+    }
+
+    reloadInProgress = true;
+    const resolvers = debounceResolvers.splice(0);
+    try {
+        await regenerateConfig();
+        await validateConfig();
+        await reloadHAProxy();
+        resolvers.forEach(r => r.resolve());
+    } catch (err) {
+        console.error('[registration-api] Debounced reload failed:', err.message);
+        resolvers.forEach(r => r.reject(err));
+    } finally {
+        reloadInProgress = false;
+        // If another reload was queued while we were busy, run it now
+        if (reloadQueued) {
+            reloadQueued = false;
+            executeReload();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,13 +696,21 @@ async function handleRegister(req, res) {
             });
         }
 
-        // New registration: read raw file, preserve comments, append new line
+        // New registration: read raw file, remove any stale entries for this domain,
+        // then append the new line. This deduplicates in case of previous bugs or
+        // manual edits that left duplicate entries.
         const rawContent = existsSync(DOMAINS_MAP) ? readFileSync(DOMAINS_MAP, 'utf8') : '';
         const backupContent = rawContent;
         const newLine = entryToMapLine(newEntry);
-        const updatedContent = rawContent.endsWith('\n') || rawContent === ''
-            ? rawContent + newLine + '\n'
-            : rawContent + '\n' + newLine + '\n';
+        const dedupedLines = rawContent.split('\n').filter(line => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) return true;
+            return trimmed.split(/\s+/)[0] !== newEntry.domain;
+        });
+        const dedupedContent = dedupedLines.join('\n');
+        const updatedContent = dedupedContent.endsWith('\n') || dedupedContent === ''
+            ? dedupedContent + newLine + '\n'
+            : dedupedContent + '\n' + newLine + '\n';
 
         writeDomainsMap(updatedContent);
 

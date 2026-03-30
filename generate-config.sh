@@ -108,6 +108,8 @@ declare -A EXTRA_LISTEN_PORTS    # listen_port -> mode (http|tcp)
 declare -A EXTRA_MAP_ENTRIES     # listen_port -> "domain backend_name\n..."
 declare -A EXTRA_PORT_DOMAIN_COUNT  # listen_port -> number of domains
 declare -A EXTRA_SINGLE_BACKEND  # listen_port -> backend name (for single-domain tcp)
+declare -A SEEN_DOMAINS          # domain -> 1 (deduplication: last entry wins)
+has_extra_ports=false
 
 # ---------------------------------------------------------------------------
 # Process domains.map
@@ -134,6 +136,13 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         echo "Warning: Skipping invalid line: $line"
         continue
     fi
+
+    # Deduplicate: if we've already seen this domain, skip (last entry wins via two-pass)
+    if [[ -n "${SEEN_DOMAINS[$domain]:-}" ]]; then
+        echo "Warning: Duplicate domain '$domain', using first occurrence" >&2
+        continue
+    fi
+    SEEN_DOMAINS["$domain"]=1
 
     # Validate fields (defense-in-depth — API should have validated already)
     if [[ ! "$domain" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]; then
@@ -212,6 +221,7 @@ EOF
 
         # Register this listen port
         EXTRA_LISTEN_PORTS["$listen_port"]="$extra_mode"
+        has_extra_ports=true
 
         # Backend name format: <container>-extra-<listen>
         local_backend="${container}-extra-${listen_port}"
@@ -280,7 +290,7 @@ fi
 # Generate extra port frontends and map files
 # ---------------------------------------------------------------------------
 
-if (( ${#EXTRA_LISTEN_PORTS[@]} > 0 )); then
+if [[ "$has_extra_ports" == "true" ]]; then
     # Initialize the extra frontends config file
     {
         echo "# Auto-generated extra port frontends"
@@ -304,7 +314,7 @@ if (( ${#EXTRA_LISTEN_PORTS[@]} > 0 )); then
 frontend extra-http-${listen_port}
     mode http
     bind *:${listen_port}
-    use_backend %[req.hdr(host),lower,map(${MAP_PATH_PREFIX}/extra-${listen_port}-domains.map,no-match)]
+    use_backend %[req.hdr(host),lower,regsub(:.*$,,),map(${MAP_PATH_PREFIX}/extra-${listen_port}-domains.map,no-match)]
 EOF
         elif (( domain_count == 1 )); then
             # TCP mode with single domain: use default_backend (no SNI)
@@ -355,7 +365,7 @@ if [[ "$has_mapdownload" == "true" ]]; then
     echo "  - ${CONF_DIR}/15-frontend-mapdownload.cfg"
     echo "  - ${MAPS_DIR}/mapdownload-domains.map"
 fi
-if (( ${#EXTRA_LISTEN_PORTS[@]} > 0 )); then
+if [[ "$has_extra_ports" == "true" ]]; then
     echo "  - ${CONF_DIR}/30-extra-frontends.cfg"
     for listen_port in $(printf '%s\n' "${!EXTRA_LISTEN_PORTS[@]}" | sort -n); do
         echo "  - ${MAPS_DIR}/extra-${listen_port}-domains.map"
