@@ -123,6 +123,7 @@ declare -A EXTRA_MAP_ENTRIES     # listen_port -> "domain backend_name\n..."
 declare -A EXTRA_PORT_DOMAIN_COUNT  # listen_port -> number of domains
 declare -A EXTRA_SINGLE_BACKEND  # listen_port -> backend name (for single-domain tcp)
 declare -A SEEN_DOMAINS          # domain -> 1 (deduplication: last entry wins)
+declare -A SEEN_BACKENDS         # backend_name -> 1 (prevent duplicate backend blocks)
 has_extra_ports=false
 
 # ---------------------------------------------------------------------------
@@ -170,37 +171,56 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
     # Generate HTTP map entry and backend (skip if port is -)
     if [[ "$http_port" != "-" ]]; then
-        printf '%s    %s-http\n' "$domain" "$container" >> "${MAPS_DIR}/http-domains.map"
-        cat >> "${CONF_DIR}/20-backends.cfg" << EOF
+        http_backend="${container}-http"
+        printf '%s    %s\n' "$domain" "$http_backend" >> "${MAPS_DIR}/http-domains.map"
+        # Only generate backend block once per unique name
+        if [[ -z "${SEEN_BACKENDS[${http_backend}]:-}" ]]; then
+            SEEN_BACKENDS["${http_backend}"]=1
+            cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
-backend ${container}-http
+backend ${http_backend}
     mode http
     server ${container} ${container}:${http_port} init-addr last,libc,none
 EOF
+        fi
     fi
 
     # Generate HTTPS map entry and backend (skip if port is -)
+    # Include port in backend name when not the standard 443, to support
+    # multiple domains on the same container with different HTTPS ports
+    # (e.g., primary on 443, alias via ssl-alias-proxy on 8444)
     if [[ "$https_port" != "-" ]]; then
-        printf '%s    %s-https\n' "$domain" "$container" >> "${MAPS_DIR}/https-domains.map"
-        cat >> "${CONF_DIR}/20-backends.cfg" << EOF
+        if [[ "$https_port" == "443" ]]; then
+            https_backend="${container}-https"
+        else
+            https_backend="${container}-https-${https_port}"
+        fi
+        printf '%s    %s\n' "$domain" "$https_backend" >> "${MAPS_DIR}/https-domains.map"
+        if [[ -z "${SEEN_BACKENDS[${https_backend}]:-}" ]]; then
+            SEEN_BACKENDS["${https_backend}"]=1
+            cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
-backend ${container}-https
+backend ${https_backend}
     mode tcp
     server ${container} ${container}:${https_port} check inter 5s fall 3 rise 2 init-addr last,libc,none
 EOF
+        fi
     fi
 
     # Generate mapdownload backend if 5th field is specified and not -
     if [[ -n "$map_port" && "$map_port" != "-" ]]; then
         has_mapdownload=true
         printf '%s    %s-mapdownload\n' "$domain" "$container" >> "${MAPS_DIR}/mapdownload-domains.map"
-        cat >> "${CONF_DIR}/20-backends.cfg" << EOF
+        if [[ -z "${SEEN_BACKENDS[${container}-mapdownload]:-}" ]]; then
+            SEEN_BACKENDS["${container}-mapdownload"]=1
+            cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
 backend ${container}-mapdownload
     mode http
     timeout server 5m
     server ${container} ${container}:${map_port} init-addr last,libc,none
 EOF
+        fi
     fi
 
     # Parse extra port fields (fields 6+, index 5+)
@@ -251,21 +271,24 @@ EOF
         EXTRA_PORT_DOMAIN_COUNT["$listen_port"]=$(( ${EXTRA_PORT_DOMAIN_COUNT[$listen_port]:-0} + 1 ))
         EXTRA_SINGLE_BACKEND["$listen_port"]="$local_backend"
 
-        # Generate backend block for this extra port
-        if [[ "$extra_mode" == "http" ]]; then
-            cat >> "${CONF_DIR}/20-backends.cfg" << EOF
+        # Generate backend block for this extra port (deduplicated)
+        if [[ -z "${SEEN_BACKENDS[${local_backend}]:-}" ]]; then
+            SEEN_BACKENDS["${local_backend}"]=1
+            if [[ "$extra_mode" == "http" ]]; then
+                cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
 backend ${local_backend}
     mode http
     server ${container} ${container}:${target_port} check inter 5s fall 3 rise 2 init-addr last,libc,none
 EOF
-        else
-            cat >> "${CONF_DIR}/20-backends.cfg" << EOF
+            else
+                cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
 backend ${local_backend}
     mode tcp
     server ${container} ${container}:${target_port} check inter 5s fall 3 rise 2 init-addr last,libc,none
 EOF
+            fi
         fi
     done
 
