@@ -1,14 +1,70 @@
 # Backend Container Configuration for HAProxy Integration
 
-This document provides instructions for configuring Docker containers to work with the HAProxy reverse proxy setup.
+This document explains how to register your Docker service with HAProxy for domain-based routing.
+
+## Quick Start: Registration API (Recommended)
+
+HAProxy includes a Registration API that lets containers self-register their domain routing. No SSH, no manual config editing required.
+
+### Register your service
+
+From inside any container on `haproxy-net`:
+
+```bash
+curl -X POST http://haproxy:8404/v1/backends \
+    -H "Content-Type: application/json" \
+    -d '{
+        "domain": "myservice.example.com",
+        "container": "my-container-name",
+        "http_port": 80,
+        "https_port": 443
+    }'
+```
+
+With extra ports (WebSocket, custom TCP):
+```bash
+curl -X POST http://haproxy:8404/v1/backends \
+    -H "Content-Type: application/json" \
+    -d '{
+        "domain": "myservice.example.com",
+        "container": "my-container-name",
+        "http_port": 80,
+        "https_port": 443,
+        "extra_ports": [
+            {"listen": 8080, "target": 8080, "mode": "http"},
+            {"listen": 9443, "target": 9443, "mode": "tcp"}
+        ]
+    }'
+```
+
+### Check registration
+
+```bash
+curl http://haproxy:8404/v1/backends/myservice.example.com
+```
+
+### Unregister
+
+```bash
+curl -X DELETE http://haproxy:8404/v1/backends/myservice.example.com
+```
+
+### ssl-manager integration
+
+Containers built on [ssl-manager](https://github.com/unicitynetwork/ssl-manager) handle registration automatically — just set `HAPROXY_HOST=haproxy` and `SSL_DOMAIN=myservice.example.com` as environment variables.
+
+For the full API specification, see [specs/REGISTRATION_API_SPEC.md](specs/REGISTRATION_API_SPEC.md).
+
+---
 
 ## Prerequisites
 
 - HAProxy container is running on the `haproxy-net` Docker network
 - Your container handles its own SSL/TLS termination (HAProxy uses SSL passthrough)
-- Your container exposes HTTP on port 80 and HTTPS on port 443
 
-## Configuration Steps
+## Legacy: Manual Configuration
+
+The following manual workflow is still supported but is not recommended for new deployments.
 
 ### 1. Verify the Docker Network Exists
 
