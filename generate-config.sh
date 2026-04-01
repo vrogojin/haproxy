@@ -171,13 +171,14 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
     # Generate HTTP map entry and backend (skip if port is -)
     if [[ "$http_port" != "-" ]]; then
-        printf '%s    %s-http\n' "$domain" "$container" >> "${MAPS_DIR}/http-domains.map"
-        # Only generate backend block once per unique container+port combo
-        if [[ -z "${SEEN_BACKENDS[${container}-http]:-}" ]]; then
-            SEEN_BACKENDS["${container}-http"]=1
+        http_backend="${container}-http"
+        printf '%s    %s\n' "$domain" "$http_backend" >> "${MAPS_DIR}/http-domains.map"
+        # Only generate backend block once per unique name
+        if [[ -z "${SEEN_BACKENDS[${http_backend}]:-}" ]]; then
+            SEEN_BACKENDS["${http_backend}"]=1
             cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
-backend ${container}-http
+backend ${http_backend}
     mode http
     server ${container} ${container}:${http_port} init-addr last,libc,none
 EOF
@@ -185,13 +186,21 @@ EOF
     fi
 
     # Generate HTTPS map entry and backend (skip if port is -)
+    # Include port in backend name when not the standard 443, to support
+    # multiple domains on the same container with different HTTPS ports
+    # (e.g., primary on 443, alias via ssl-alias-proxy on 8444)
     if [[ "$https_port" != "-" ]]; then
-        printf '%s    %s-https\n' "$domain" "$container" >> "${MAPS_DIR}/https-domains.map"
-        if [[ -z "${SEEN_BACKENDS[${container}-https]:-}" ]]; then
-            SEEN_BACKENDS["${container}-https"]=1
+        if [[ "$https_port" == "443" ]]; then
+            https_backend="${container}-https"
+        else
+            https_backend="${container}-https-${https_port}"
+        fi
+        printf '%s    %s\n' "$domain" "$https_backend" >> "${MAPS_DIR}/https-domains.map"
+        if [[ -z "${SEEN_BACKENDS[${https_backend}]:-}" ]]; then
+            SEEN_BACKENDS["${https_backend}"]=1
             cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
-backend ${container}-https
+backend ${https_backend}
     mode tcp
     server ${container} ${container}:${https_port} check inter 5s fall 3 rise 2 init-addr last,libc,none
 EOF
