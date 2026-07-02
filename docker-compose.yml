@@ -28,8 +28,35 @@ services:
     networks:
       - haproxy-net
 
+  # ── staging-tunnel: restricted sshd endpoint for remote (firewalled) staging backends ──
+  # Firewalled dev laptops open an SSH reverse tunnel here and register their staging
+  # domain with haproxy over an SSH -L forward. Start it independently:
+  #   docker compose up -d --build staging-tunnel
+  # Add developer keys to staging-tunnel/authorized_keys first (see staging-tunnel/README.md).
+  # The reverse-tunnel bind ports (21000-21099, internal-ports.conf) must be in the
+  # Registration API's ALLOWED_PORTS — re-run ./run-haproxy.sh to apply that allowlist.
+  staging-tunnel:
+    build:
+      context: ./staging-tunnel
+      dockerfile: Dockerfile
+    image: haproxy-staging-tunnel:latest
+    container_name: staging-tunnel
+    restart: unless-stopped
+    ports:
+      # Public sshd port for laptops to reach (the ONLY thing published for tunnels).
+      - "${STAGING_TUNNEL_SSH_PORT:-2022}:22"
+    volumes:
+      # Developer public keys (tunnel-only; see authorized_keys.example). Read-only.
+      - ./staging-tunnel/authorized_keys:/auth/authorized_keys:ro
+      # Persist host keys so the client-pinned fingerprint is stable across restarts.
+      - staging-tunnel-hostkeys:/etc/ssh/keys
+    networks:
+      # Same alias haproxy routes to: `staging-tunnel` on haproxy-net.
+      - haproxy-net
+
 volumes:
   haproxy-data:
+  staging-tunnel-hostkeys:
 
 networks:
   haproxy-net:

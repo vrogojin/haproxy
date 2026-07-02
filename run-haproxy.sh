@@ -31,6 +31,9 @@ HAPROXY_NET="${HAPROXY_NET:-haproxy-net}"
 HAPROXY_VOLUME="${HAPROXY_VOLUME:-haproxy-data}"
 HAPROXY_API_KEY="${HAPROXY_API_KEY:-}"
 PORTS_FILE="${PORTS_FILE:-${SCRIPT_DIR}/allowed-ports.conf}"
+# Internal ports FILE: extra ports allowed for REGISTRATION but NOT published on the
+# host (e.g. staging SSH reverse-tunnel ports that only exist inside haproxy-net).
+INTERNAL_PORTS_FILE="${INTERNAL_PORTS_FILE:-${SCRIPT_DIR}/internal-ports.conf}"
 DRY_RUN=false
 
 # Base ports always published (HAProxy core)
@@ -153,16 +156,22 @@ done
 printf "\n${C_BOLD}HAProxy Runner${C_RESET}\n"
 echo "════════════════════════════════════════"
 
-# Parse ports
+# Parse ports (published) + file-internal ports (allowed for registration, not published)
 CONFIGURED_PORTS=$(parse_ports_file "$PORTS_FILE")
-ALLOWED_PORTS_CSV=$(build_allowed_ports_env "$CONFIGURED_PORTS")
+FILE_INTERNAL_PORTS=""
+if [ -f "$INTERNAL_PORTS_FILE" ]; then
+    FILE_INTERNAL_PORTS=$(parse_ports_file "$INTERNAL_PORTS_FILE")
+fi
+ALLOWED_PORTS_CSV=$(build_allowed_ports_env "$CONFIGURED_PORTS $FILE_INTERNAL_PORTS")
 
 port_count=$(echo "$CONFIGURED_PORTS" | wc -w)
+internal_count=$(echo "$FILE_INTERNAL_PORTS" | wc -w)
 echo "  Image:      $HAPROXY_IMAGE"
 echo "  Container:  $HAPROXY_CONTAINER"
 echo "  Network:    $HAPROXY_NET"
 echo "  Ports file: $PORTS_FILE"
-echo "  Ports:      $port_count configured + 2 base (80, 443)"
+echo "  Ports:      $port_count published + 2 base (80, 443)"
+echo "  Internal:   $internal_count allowed-not-published ($INTERNAL_PORTS_FILE)"
 echo "  Allowed:    $ALLOWED_PORTS_CSV"
 echo ""
 
