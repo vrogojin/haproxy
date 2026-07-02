@@ -15,7 +15,11 @@ fi
 # authorized_keys is absent — see docker-compose.yml).
 if [ -f /auth-src/authorized_keys ]; then
   install -o tunnel -g tunnel -m 600 /auth-src/authorized_keys /home/tunnel/.ssh/authorized_keys
-  echo "[staging-tunnel] installed $(grep -c . /home/tunnel/.ssh/authorized_keys 2>/dev/null || echo 0) authorized key line(s)"
+  # Count only real key lines (non-comment, non-blank) — an all-comments file (e.g. the
+  # example copied without adding a key) must report 0, not the comment-line count.
+  _keys="$(grep -cE '^[[:space:]]*[^#[:space:]]' /home/tunnel/.ssh/authorized_keys 2>/dev/null || echo 0)"
+  echo "[staging-tunnel] installed ${_keys} authorized key(s)"
+  [ "${_keys}" -eq 0 ] && echo "[staging-tunnel] WARN: authorized_keys has no usable keys — every tunnel will be refused" >&2
 else
   echo "[staging-tunnel] WARN: no authorized_keys found (create staging-tunnel/authorized_keys from the example) — no one can tunnel" >&2
 fi

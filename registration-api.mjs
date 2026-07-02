@@ -628,11 +628,28 @@ async function handleRegister(req, res) {
         return sendJson(res, 422, { error: 'At least one of http_port or https_port must be non-null', code: 'VALIDATION_ERROR' });
     }
 
+    // haproxy's own internal ports (admin UI + the Registration API) must NEVER be a
+    // backend target for ANY port field, or a registration could route public :80/:443
+    // straight at them (e.g. https_port:8404 → SNI-routes a domain to the unauthenticated
+    // Registration API on :443). Reject them unconditionally — independent of ALLOWED_PORTS
+    // — for http_port, https_port and map_port. (extra_ports is already guarded in
+    // validateExtraPorts.) This is stricter than the allowlist below, which treats 80/443
+    // as always-allowed base ports.
+    const INTERNAL_ONLY_PORTS = new Set([8000, 8404]);
+    for (const [val, name] of [[httpPort, 'http_port'], [httpsPort, 'https_port'], [mapPort, 'map_port']]) {
+        if (val !== null && INTERNAL_ONLY_PORTS.has(val)) {
+            return sendJson(res, 422, {
+                error: `${name} ${val} is reserved for haproxy internal use and cannot be a backend target`,
+                code: 'PORT_NOT_ALLOWED'
+            });
+        }
+    }
+
     // Validate the LISTEN ports against the allowlist (if configured). http_port is
-    // deliberately NOT checked: it is the backend's HTTP *target* port (haproxy connects
-    // to container:http_port for the shared :80 frontend), not a port haproxy binds or
-    // publishes — so allowlisting it governs nothing host-exposed, and doing so would
-    // reject legitimate backends whose internal HTTP port isn't curated (e.g. the
+    // deliberately NOT allowlist-checked: it is the backend's HTTP *target* port (haproxy
+    // connects to container:http_port for the shared :80 frontend), not a port haproxy
+    // binds or publishes — so allowlisting it governs nothing host-exposed, and doing so
+    // would reject legitimate backends whose internal HTTP port isn't curated (e.g. the
     // concierge backend's 8080). https_port / map_port / extra_ports ARE listen ports.
     if (ALLOWED_PORTS) {
         for (const [val, name] of [[httpsPort, 'https_port'], [mapPort, 'map_port']]) {
