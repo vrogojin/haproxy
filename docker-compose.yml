@@ -53,8 +53,11 @@ services:
       # Public sshd port for laptops to reach (the ONLY thing published for tunnels).
       - "${STAGING_TUNNEL_SSH_PORT:-2022}:22"
     volumes:
-      # Developer public keys (tunnel-only; see authorized_keys.example). Read-only.
-      - ./staging-tunnel/authorized_keys:/auth/authorized_keys:ro
+      # Mount the DIRECTORY (which always exists), not the file: bind-mounting a MISSING
+      # authorized_keys file source makes Docker auto-create it as an empty directory, and
+      # sshd would then start with zero keys (endpoint healthy, every tunnel refused).
+      # The entrypoint reads /auth-src/authorized_keys. (See authorized_keys.example.)
+      - ./staging-tunnel:/auth-src:ro
       # Persist host keys so the client-pinned fingerprint is stable across restarts.
       - staging-tunnel-hostkeys:/etc/ssh/keys
     networks:

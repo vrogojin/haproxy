@@ -628,11 +628,14 @@ async function handleRegister(req, res) {
         return sendJson(res, 422, { error: 'At least one of http_port or https_port must be non-null', code: 'VALIDATION_ERROR' });
     }
 
-    // Validate ports against allowlist (if configured). Include http_port too — an
-    // un-allowlisted http_port would otherwise be written verbatim into domains.map and
-    // routed on, bypassing the port allowlist (default 80 is reserved, so it passes).
+    // Validate the LISTEN ports against the allowlist (if configured). http_port is
+    // deliberately NOT checked: it is the backend's HTTP *target* port (haproxy connects
+    // to container:http_port for the shared :80 frontend), not a port haproxy binds or
+    // publishes — so allowlisting it governs nothing host-exposed, and doing so would
+    // reject legitimate backends whose internal HTTP port isn't curated (e.g. the
+    // concierge backend's 8080). https_port / map_port / extra_ports ARE listen ports.
     if (ALLOWED_PORTS) {
-        for (const [val, name] of [[httpPort, 'http_port'], [httpsPort, 'https_port'], [mapPort, 'map_port']]) {
+        for (const [val, name] of [[httpsPort, 'https_port'], [mapPort, 'map_port']]) {
             if (val !== null && !RESERVED_PORTS.has(val) && !ALLOWED_PORTS.has(val)) {
                 return sendJson(res, 422, {
                     error: `${name} ${val} is not in the allowed ports list. Contact the administrator to add this port to the allowed list.`,
