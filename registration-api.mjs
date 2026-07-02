@@ -628,9 +628,11 @@ async function handleRegister(req, res) {
         return sendJson(res, 422, { error: 'At least one of http_port or https_port must be non-null', code: 'VALIDATION_ERROR' });
     }
 
-    // Validate ports against allowlist (if configured)
+    // Validate ports against allowlist (if configured). Include http_port too — an
+    // un-allowlisted http_port would otherwise be written verbatim into domains.map and
+    // routed on, bypassing the port allowlist (default 80 is reserved, so it passes).
     if (ALLOWED_PORTS) {
-        for (const [val, name] of [[httpsPort, 'https_port'], [mapPort, 'map_port']]) {
+        for (const [val, name] of [[httpPort, 'http_port'], [httpsPort, 'https_port'], [mapPort, 'map_port']]) {
             if (val !== null && !RESERVED_PORTS.has(val) && !ALLOWED_PORTS.has(val)) {
                 return sendJson(res, 422, {
                     error: `${name} ${val} is not in the allowed ports list. Contact the administrator to add this port to the allowed list.`,

@@ -16,13 +16,20 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      # Add service ports from allowed-ports.conf here if using docker-compose
-      # See ./run-haproxy.sh for the automated approach
+      # Service ports published on the host. Keep in sync with allowed-ports.conf.
+      # PREFER ./run-haproxy.sh, which derives both this list and ALLOWED_PORTS from
+      # allowed-ports.conf + internal-ports.conf so the two never drift.
+      - "8000:8000"
+      - "50001-50004:50001-50004"
+      # NOTE: the staging SSH-tunnel ports (21000-21099, internal-ports.conf) are
+      # allowed for registration but intentionally NOT published here (internal to
+      # haproxy-net). Port 8404 is NOT published — the Registration API is internal only.
     environment:
-      # Comma-separated list of allowed extra ports (enforced by Registration API)
-      # Must match the ports listed above. Generate with:
-      #   grep -v '^#' allowed-ports.conf | tr '\n' ',' | sed 's/,$//'
-      - ALLOWED_PORTS=80,443,3443,4001,4003,8000,8888,9000,9001,9080,27950,27951,50001,50002,50003,50004
+      # Allowed registration ports (enforced by the Registration API). MUST include the
+      # internal-ports.conf range (21000-21099) or tunnels get PORT_NOT_ALLOWED.
+      # Authoritative source is ./run-haproxy.sh — this hardcoded list is for the
+      # discouraged plain-compose path and must be kept in sync by hand.
+      - ALLOWED_PORTS=80,443,3443,4001,4003,8000,8888,9000,9001,9080,21000,21001,21002,21003,21004,21005,21006,21007,21008,21009,21010,21011,21012,21013,21014,21015,21016,21017,21018,21019,21020,21021,21022,21023,21024,21025,21026,21027,21028,21029,21030,21031,21032,21033,21034,21035,21036,21037,21038,21039,21040,21041,21042,21043,21044,21045,21046,21047,21048,21049,21050,21051,21052,21053,21054,21055,21056,21057,21058,21059,21060,21061,21062,21063,21064,21065,21066,21067,21068,21069,21070,21071,21072,21073,21074,21075,21076,21077,21078,21079,21080,21081,21082,21083,21084,21085,21086,21087,21088,21089,21090,21091,21092,21093,21094,21095,21096,21097,21098,21099,27950,27951,50001,50002,50003,50004
     volumes:
       - haproxy-data:/etc/haproxy
     networks:

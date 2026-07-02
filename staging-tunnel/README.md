@@ -55,6 +55,10 @@ carries encrypted traffic only. The concierge side is `docker/staging-tunnel/` +
 
 - **Key-only, no shell, no PTY.** `restrict,port-forwarding` disables everything except the
   forwards we need; `permitopen="haproxy:8404"` limits `-L` to the Registration API only.
+- **Fail-closed by default.** Even a key added *without* those per-key options can't get a
+  shell or reach other services: `sshd_config` sets `ForceCommand /bin/false` (any exec/shell
+  request dies; `-N` tunnels are unaffected) and a global `PermitOpen haproxy:8404` (bounds `-L`
+  for all keys). Per-key options remain the belt to this braces.
 - **Reverse-tunnel bind ports** are bounded by the haproxy `ALLOWED_PORTS` allowlist
   (`21000-21099`) — a port a client binds that no domain is registered to is inert.
 - **Trust boundary.** A key-holder gains `haproxy-net` reach to `:8404` and can register
