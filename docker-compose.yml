@@ -1,3 +1,11 @@
+# HAProxy with Dynamic Backend Registration
+#
+# RECOMMENDED: Use ./run-haproxy.sh instead of docker-compose.
+# run-haproxy.sh reads allowed-ports.conf and publishes all configured
+# ports automatically. The Registration API enforces the allowlist.
+#
+# If using docker-compose, manually list all needed ports below.
+
 services:
   haproxy:
     build:
@@ -8,9 +16,13 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "8000:8000"
-      - "50001-50004:50001-50004"
-      # Port 8404 is NOT published -- API is internal only
+      # Add service ports from allowed-ports.conf here if using docker-compose
+      # See ./run-haproxy.sh for the automated approach
+    environment:
+      # Comma-separated list of allowed extra ports (enforced by Registration API)
+      # Must match the ports listed above. Generate with:
+      #   grep -v '^#' allowed-ports.conf | tr '\n' ',' | sed 's/,$//'
+      - ALLOWED_PORTS=80,443,3443,4001,4003,8000,8888,9000,9001,9080,27950,27951,50001,50002,50003,50004
     volumes:
       - haproxy-data:/etc/haproxy
     networks:

@@ -32,6 +32,21 @@ const API_KEY = process.env.HAPROXY_API_KEY || '';
 const MAX_REGISTRATIONS = parseInt(process.env.MAX_REGISTRATIONS || '100', 10);
 
 const RESERVED_PORTS = new Set([80, 443, 8000, 8404]);
+
+// Allowed ports — if ALLOWED_PORTS is set, only these ports can be used for
+// extra_ports and https_port registrations. Ports not in this set are rejected.
+// Format: comma-separated list of port numbers (e.g., "80,443,9000,9001,27950")
+// If not set, all non-reserved ports are allowed (backwards compatible).
+const ALLOWED_PORTS = process.env.ALLOWED_PORTS
+    ? new Set(process.env.ALLOWED_PORTS.split(',').map(p => parseInt(p.trim(), 10)).filter(p => p > 0 && p <= 65535))
+    : null;
+
+if (ALLOWED_PORTS) {
+    console.log(`[registration-api] Port allowlist active: ${[...ALLOWED_PORTS].sort((a, b) => a - b).join(', ')}`);
+} else {
+    console.log('[registration-api] No port allowlist — all non-reserved ports accepted');
+}
+
 const LOCK_PATH = path.join(STATE_DIR, 'domains.lock');
 const REGISTRATIONS_PATH = path.join(STATE_DIR, 'registrations.json');
 
@@ -473,6 +488,9 @@ function validateExtraPorts(extraPorts, existingEntries) {
         if (RESERVED_PORTS.has(ep.listen)) {
             return { error: `extra_ports[${i}].listen port ${ep.listen} is reserved (80, 443, 8000, 8404)`, code: 'VALIDATION_ERROR' };
         }
+        if (ALLOWED_PORTS && !ALLOWED_PORTS.has(ep.listen)) {
+            return { error: `extra_ports[${i}].listen port ${ep.listen} is not in the allowed ports list. Contact the administrator to add this port to the allowed list.`, code: 'PORT_NOT_ALLOWED' };
+        }
         if (typeof ep.target !== 'number' || !Number.isInteger(ep.target) || ep.target < 1 || ep.target > 65535) {
             return { error: `extra_ports[${i}].target must be an integer between 1 and 65535`, code: 'VALIDATION_ERROR' };
         }
@@ -608,6 +626,18 @@ async function handleRegister(req, res) {
 
     if (httpPort === null && httpsPort === null) {
         return sendJson(res, 422, { error: 'At least one of http_port or https_port must be non-null', code: 'VALIDATION_ERROR' });
+    }
+
+    // Validate ports against allowlist (if configured)
+    if (ALLOWED_PORTS) {
+        for (const [val, name] of [[httpsPort, 'https_port'], [mapPort, 'map_port']]) {
+            if (val !== null && !RESERVED_PORTS.has(val) && !ALLOWED_PORTS.has(val)) {
+                return sendJson(res, 422, {
+                    error: `${name} ${val} is not in the allowed ports list. Contact the administrator to add this port to the allowed list.`,
+                    code: 'PORT_NOT_ALLOWED'
+                });
+            }
+        }
     }
 
     const newEntry = {
