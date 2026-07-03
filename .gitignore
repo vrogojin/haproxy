@@ -6,3 +6,6 @@ domains.map
 # Auto-generated files (regenerate with ./generate-config.sh)
 conf.d/
 maps/
+
+# staging-tunnel developer keys (never commit) — keep only authorized_keys.example
+staging-tunnel/authorized_keys

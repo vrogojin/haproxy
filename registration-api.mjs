@@ -32,6 +32,21 @@ const API_KEY = process.env.HAPROXY_API_KEY || '';
 const MAX_REGISTRATIONS = parseInt(process.env.MAX_REGISTRATIONS || '100', 10);
 
 const RESERVED_PORTS = new Set([80, 443, 8000, 8404]);
+
+// Allowed ports — if ALLOWED_PORTS is set, only these ports can be used for
+// extra_ports and https_port registrations. Ports not in this set are rejected.
+// Format: comma-separated list of port numbers (e.g., "80,443,9000,9001,27950")
+// If not set, all non-reserved ports are allowed (backwards compatible).
+const ALLOWED_PORTS = process.env.ALLOWED_PORTS
+    ? new Set(process.env.ALLOWED_PORTS.split(',').map(p => parseInt(p.trim(), 10)).filter(p => p > 0 && p <= 65535))
+    : null;
+
+if (ALLOWED_PORTS) {
+    console.log(`[registration-api] Port allowlist active: ${[...ALLOWED_PORTS].sort((a, b) => a - b).join(', ')}`);
+} else {
+    console.log('[registration-api] No port allowlist — all non-reserved ports accepted');
+}
+
 const LOCK_PATH = path.join(STATE_DIR, 'domains.lock');
 const REGISTRATIONS_PATH = path.join(STATE_DIR, 'registrations.json');
 
@@ -473,6 +488,9 @@ function validateExtraPorts(extraPorts, existingEntries) {
         if (RESERVED_PORTS.has(ep.listen)) {
             return { error: `extra_ports[${i}].listen port ${ep.listen} is reserved (80, 443, 8000, 8404)`, code: 'VALIDATION_ERROR' };
         }
+        if (ALLOWED_PORTS && !ALLOWED_PORTS.has(ep.listen)) {
+            return { error: `extra_ports[${i}].listen port ${ep.listen} is not in the allowed ports list. Contact the administrator to add this port to the allowed list.`, code: 'PORT_NOT_ALLOWED' };
+        }
         if (typeof ep.target !== 'number' || !Number.isInteger(ep.target) || ep.target < 1 || ep.target > 65535) {
             return { error: `extra_ports[${i}].target must be an integer between 1 and 65535`, code: 'VALIDATION_ERROR' };
         }
@@ -608,6 +626,40 @@ async function handleRegister(req, res) {
 
     if (httpPort === null && httpsPort === null) {
         return sendJson(res, 422, { error: 'At least one of http_port or https_port must be non-null', code: 'VALIDATION_ERROR' });
+    }
+
+    // haproxy's own internal ports (admin UI + the Registration API) must NEVER be a
+    // backend target for ANY port field, or a registration could route public :80/:443
+    // straight at them (e.g. https_port:8404 → SNI-routes a domain to the unauthenticated
+    // Registration API on :443). Reject them unconditionally — independent of ALLOWED_PORTS
+    // — for http_port, https_port and map_port. (extra_ports is already guarded in
+    // validateExtraPorts.) This is stricter than the allowlist below, which treats 80/443
+    // as always-allowed base ports.
+    const INTERNAL_ONLY_PORTS = new Set([8000, 8404]);
+    for (const [val, name] of [[httpPort, 'http_port'], [httpsPort, 'https_port'], [mapPort, 'map_port']]) {
+        if (val !== null && INTERNAL_ONLY_PORTS.has(val)) {
+            return sendJson(res, 422, {
+                error: `${name} ${val} is reserved for haproxy internal use and cannot be a backend target`,
+                code: 'PORT_NOT_ALLOWED'
+            });
+        }
+    }
+
+    // Validate the LISTEN ports against the allowlist (if configured). http_port is
+    // deliberately NOT allowlist-checked: it is the backend's HTTP *target* port (haproxy
+    // connects to container:http_port for the shared :80 frontend), not a port haproxy
+    // binds or publishes — so allowlisting it governs nothing host-exposed, and doing so
+    // would reject legitimate backends whose internal HTTP port isn't curated (e.g. the
+    // concierge backend's 8080). https_port / map_port / extra_ports ARE listen ports.
+    if (ALLOWED_PORTS) {
+        for (const [val, name] of [[httpsPort, 'https_port'], [mapPort, 'map_port']]) {
+            if (val !== null && !RESERVED_PORTS.has(val) && !ALLOWED_PORTS.has(val)) {
+                return sendJson(res, 422, {
+                    error: `${name} ${val} is not in the allowed ports list. Contact the administrator to add this port to the allowed list.`,
+                    code: 'PORT_NOT_ALLOWED'
+                });
+            }
+        }
     }
 
     const newEntry = {
