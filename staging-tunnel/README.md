@@ -3,6 +3,9 @@
 A restricted, tunnel-only OpenSSH server on `haproxy-net` that lets **firewalled hosts**
 (dev laptops, no public IP) serve a staging backend through the shared public haproxy.
 
+> The **client** side — a standalone image to tunnel **any** http/https service through
+> this endpoint (not just concierge) — lives in [`../tunnel-client`](../tunnel-client).
+
 A laptop opens an **SSH reverse tunnel** here and registers its domain with the shared
 haproxy over an SSH `-L` forward to the Registration API:
 
