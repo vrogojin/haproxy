@@ -14,6 +14,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import dns from 'node:dns';
+import net from 'node:net';
 
 const execFileAsync = promisify(execFile);
 const dnsResolve4 = promisify(dns.resolve4);
@@ -30,6 +31,7 @@ const STATE_DIR = process.env.HAPROXY_STATE_DIR || '/etc/haproxy/state';
 const TEMPLATES_DIR = process.env.HAPROXY_TEMPLATES_DIR || '/usr/local/share/haproxy/templates';
 const API_KEY = process.env.HAPROXY_API_KEY || '';
 const MAX_REGISTRATIONS = parseInt(process.env.MAX_REGISTRATIONS || '100', 10);
+const ADMIN_SOCK = process.env.HAPROXY_ADMIN_SOCK || '/var/run/haproxy.sock';
 
 const RESERVED_PORTS = new Set([80, 443, 8000, 8404]);
 
@@ -316,6 +318,92 @@ function getHAProxyWorkerPids(masterPid) {
         }
     }
     return pids;
+}
+
+// ---------------------------------------------------------------------------
+// HAProxy runtime admin socket — self-healing server-state control
+// ---------------------------------------------------------------------------
+// These talk to the HAProxy stats socket (level admin) so we can surgically
+// change a server's state WITHOUT a full config reload — used to (a) bring a
+// re-announcing backend out of MAINT / MAINT(resolution) immediately, and
+// (b) gracefully drain a backend that is intentionally shutting down.
+
+function haproxyAdmin(commands, timeoutMs = 3000) {
+    return new Promise((resolve) => {
+        if (!commands.length) return resolve('');
+        let out = '';
+        let settled = false;
+        const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+        let sock;
+        try {
+            sock = net.createConnection(ADMIN_SOCK);
+        } catch (e) {
+            console.error(JSON.stringify({ msg: 'haproxy admin connect failed', error: e.message }));
+            return done('');
+        }
+        const timer = setTimeout(() => { try { sock.destroy(); } catch {} done(out); }, timeoutMs);
+        sock.on('connect', () => { sock.write(commands.join(';') + '\n'); sock.end(); });
+        sock.on('data', (d) => { out += d.toString(); });
+        sock.on('end', () => { clearTimeout(timer); done(out); });
+        sock.on('error', (e) => {
+            clearTimeout(timer);
+            console.error(JSON.stringify({ msg: 'haproxy admin socket error', error: e.message }));
+            done(out);
+        });
+    });
+}
+
+// Map a domains.map entry to the backend/server identifiers generate-config.sh
+// emits. Server name is always the container name; backend name mirrors the
+// generator (…-http, …-https[-<port>], …-mapdownload, …-extra-<listen>).
+function serverIdsForEntry(entry) {
+    const ids = [];
+    const c = entry.container;
+    if (entry.http_port != null) ids.push({ backend: `${c}-http`, server: c });
+    if (entry.https_port != null) {
+        const b = entry.https_port === 443 ? `${c}-https` : `${c}-https-${entry.https_port}`;
+        ids.push({ backend: b, server: c });
+    }
+    if (entry.map_port != null) ids.push({ backend: `${c}-mapdownload`, server: c });
+    if (Array.isArray(entry.extra_ports)) {
+        for (const ep of entry.extra_ports) ids.push({ backend: `${c}-extra-${ep.listen}`, server: c });
+    }
+    return ids;
+}
+
+// Bring every server for this entry READY immediately (idempotent). Resolves the
+// container's current IP via Docker DNS and pushes it with `set server addr`, then
+// `set server state ready` — this clears MAINT(resolution) the instant a backend
+// re-announces, without waiting for the next health-check or a reload. Best-effort:
+// pre-rollout (no resolvers section) `set server addr` is rejected and simply ignored.
+async function kickServersReady(entry) {
+    try {
+        const ids = serverIdsForEntry(entry);
+        if (!ids.length) return;
+        let ip = null;
+        try { const a = await dnsResolve4(entry.container); ip = a && a[0]; } catch {}
+        const cmds = [];
+        for (const { backend, server } of ids) {
+            if (ip) cmds.push(`set server ${backend}/${server} addr ${ip}`);
+            cmds.push(`set server ${backend}/${server} state ready`);
+        }
+        await haproxyAdmin(cmds);
+        console.log(JSON.stringify({ msg: 'haproxy kick ready', domain: entry.domain, ip: ip || null, servers: ids.length }));
+    } catch (e) {
+        console.error(JSON.stringify({ msg: 'haproxy kick ready failed', error: e instanceof Error ? e.message : String(e) }));
+    }
+}
+
+// Gracefully drain every server for this entry (set to MAINT) via the runtime
+// socket — no map change, no reload. Used by the deregister endpoint so a node
+// that is intentionally shutting down stops receiving traffic cleanly.
+async function drainServers(entry) {
+    const ids = serverIdsForEntry(entry);
+    if (!ids.length) return 0;
+    const cmds = ids.map(({ backend, server }) => `set server ${backend}/${server} state maint`);
+    await haproxyAdmin(cmds);
+    console.log(JSON.stringify({ msg: 'haproxy drain', domain: entry.domain, servers: ids.length }));
+    return ids.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +797,9 @@ async function handleRegister(req, res) {
                 const registrations = readRegistrations();
                 const resp = entryToResponse(existing, registrations);
                 resp.message = 'Already registered with identical configuration';
+                // Re-announce: a re-registering node may have restarted while its
+                // server sat in MAINT(resolution). Bring it READY now (idempotent).
+                await kickServersReady(existing);
                 return sendJson(res, 200, resp);
             }
             if (existing.container === newEntry.container) {
@@ -746,6 +837,7 @@ async function handleRegister(req, res) {
                     });
                 }
 
+                await kickServersReady(newEntry);
                 const resp = entryToResponse(newEntry, registrations);
                 resp.message = 'Registration updated';
                 return sendJson(res, 200, resp);
@@ -801,6 +893,7 @@ async function handleRegister(req, res) {
             });
         }
 
+        await kickServersReady(newEntry);
         const resp = entryToResponse(newEntry, registrations);
         return sendJson(res, 201, resp);
 
@@ -909,6 +1002,27 @@ async function handleDelete(req, res, domain) {
     } catch (err) {
         if (lockHeld) releaseLock();
         console.error('[registration-api] Delete error:', err);
+        return sendJson(res, 500, { error: `Internal server error: ${err.message}`, code: 'INTERNAL_ERROR' });
+    }
+}
+
+async function handleDrain(req, res, domain) {
+    if (!checkAuth(req, res)) return;
+    try {
+        const { entries } = parseDomainsMap();
+        const entry = entries.find(e => e.domain === domain);
+        if (!entry) {
+            return sendJson(res, 404, { error: `No registration found for domain '${domain}'`, code: 'NOT_FOUND' });
+        }
+        // Same ownership rule as DELETE: unauthenticated callers must be the container.
+        const owned = await verifyOwnership(req, entry.container);
+        if (!owned) {
+            return sendJson(res, 403, { error: 'Only the registered container can drain this domain', code: 'OWNERSHIP_MISMATCH' });
+        }
+        const count = await drainServers(entry);
+        return sendJson(res, 200, { message: 'Backend drained (servers set to MAINT)', domain, servers_drained: count });
+    } catch (err) {
+        console.error('[registration-api] Drain error:', err);
         return sendJson(res, 500, { error: `Internal server error: ${err.message}`, code: 'INTERNAL_ERROR' });
     }
 }
@@ -1026,6 +1140,13 @@ const server = createServer(async (req, res) => {
                 sendJson(res, 400, { error: 'Domain parameter is required', code: 'VALIDATION_ERROR' });
             } else {
                 await handleGet(req, res, domain);
+            }
+        } else if (req.method === 'POST' && pathname.startsWith('/v1/backends/') && pathname.endsWith('/drain')) {
+            const domain = decodeURIComponent(pathname.slice('/v1/backends/'.length, -'/drain'.length));
+            if (!domain) {
+                sendJson(res, 400, { error: 'Domain parameter is required', code: 'VALIDATION_ERROR' });
+            } else {
+                await handleDrain(req, res, domain);
             }
         } else if (req.method === 'DELETE' && pathname.startsWith('/v1/backends/')) {
             const domain = decodeURIComponent(pathname.slice('/v1/backends/'.length));
