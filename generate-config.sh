@@ -180,7 +180,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
 backend ${http_backend}
     mode http
-    server ${container} ${container}:${http_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 2s fall 3 rise 2
+    server ${container} ${container}:${http_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
 EOF
         fi
     fi
@@ -202,7 +202,7 @@ EOF
 
 backend ${https_backend}
     mode tcp
-    server ${container} ${container}:${https_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 2s fall 3 rise 2
+    server ${container} ${container}:${https_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
 EOF
         fi
     fi
@@ -218,7 +218,7 @@ EOF
 backend ${container}-mapdownload
     mode http
     timeout server 5m
-    server ${container} ${container}:${map_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 2s fall 3 rise 2
+    server ${container} ${container}:${map_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
 EOF
         fi
     fi
@@ -279,14 +279,14 @@ EOF
 
 backend ${local_backend}
     mode http
-    server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 2s fall 3 rise 2
+    server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
 EOF
             else
                 cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
 backend ${local_backend}
     mode tcp
-    server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 2s fall 3 rise 2
+    server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
 EOF
             fi
         fi
