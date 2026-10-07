@@ -53,6 +53,35 @@ curl -X DELETE http://haproxy:8404/v1/backends/myservice.example.com
 
 Containers built on [ssl-manager](https://github.com/unicitynetwork/ssl-manager) handle registration automatically — just set `HAPROXY_HOST=haproxy` and `SSL_DOMAIN=myservice.example.com` as environment variables.
 
+> **⚠️ Certificate renewal: reloading the renewed cert is the backend's job.**
+> HAProxy does SSL **passthrough** — it holds no certificates, so it cannot help here.
+> ssl-manager's `ssl-renew` obtains and renews certs via certbot, but its deploy-hook only
+> **`touch`es** a marker file (`/tmp/.ssl-renewal-restart`); it does **not** restart your
+> service. A long-running server that loaded its cert into memory at startup will keep
+> serving the **old (eventually expired)** cert after a renewal unless *your* entrypoint
+> acts on that marker. This is a latent, fleet-wide issue affecting every ssl-manager-based
+> backend — it bit `fulcrum-alpha` in production on 2026-09-14 (served an expired cert for
+> days while a renewed one sat on disk).
+>
+> Make your entrypoint reload on renewal. The simplest robust pattern is a background
+> watcher that signals your service when the marker appears:
+>
+> ```sh
+> # while your server (PID $APP_PID) runs:
+> while kill -0 "$APP_PID" 2>/dev/null; do
+>   if [ -f /tmp/.ssl-renewal-restart ]; then
+>     rm -f /tmp/.ssl-renewal-restart
+>     kill -HUP "$APP_PID" 2>/dev/null || kill -TERM "$APP_PID"  # reload or graceful restart
+>     break
+>   fi
+>   sleep 30
+> done &
+> ```
+>
+> Verify with `touch /tmp/.ssl-renewal-restart` and confirm your service reloads the cert
+> (e.g. `openssl s_client -connect localhost:<port> | openssl x509 -noout -dates`).
+> Proper fix belongs in ssl-manager's deploy-hook; until then each backend must handle it.
+
 For the full API specification, see [specs/REGISTRATION_API_SPEC.md](specs/REGISTRATION_API_SPEC.md).
 
 ---
