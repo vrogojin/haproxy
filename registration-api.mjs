@@ -53,6 +53,17 @@ const LOCK_PATH = path.join(STATE_DIR, 'domains.lock');
 const REGISTRATIONS_PATH = path.join(STATE_DIR, 'registrations.json');
 
 const DOMAIN_RE = /^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
+
+// PROXY protocol (see docs/PROXY-PROTOCOL-V2-DESIGN.md). A backend opts in per
+// registration; omitting the field keeps the pre-PROXY behaviour ("none"), so
+// clients that never heard of it are unaffected.
+const PROXY_PROTOCOL_MODES = new Set(['v2', 'none']);
+const API_VERSION = '1.1';
+const API_FEATURES = ['proxy_protocol_v2'];
+
+function isPpToken(field) {
+    return field.startsWith('pp=') || field.startsWith('pp-');
+}
 const CONTAINER_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 
 const API_START_TIME = Date.now();
@@ -189,7 +200,7 @@ function parseDomainsMap() {
 
         let extraStartIdx = 4;
         if (parts.length > 4) {
-            if (parts[4].startsWith('extra:')) {
+            if (parts[4].startsWith('extra:') || isPpToken(parts[4])) {
                 extraStartIdx = 4;
                 mapPort = null;
             } else {
@@ -198,9 +209,31 @@ function parseDomainsMap() {
             }
         }
 
-        // Parse extra port fields
+        // Parse extra port fields and PROXY protocol option tokens
+        let proxyProtocol = 'none';
+        let httpProxyPort = null;
+        let httpsProxyPort = null;
+        const ppExtra = new Set();
         for (let i = extraStartIdx; i < parts.length; i++) {
             const field = parts[i];
+            if (field === 'pp=v2') { proxyProtocol = 'v2'; continue; }
+            if (field.startsWith('pp-http=')) {
+                const v = parseInt(field.slice('pp-http='.length), 10);
+                if (Number.isInteger(v) && v >= 1 && v <= 65535) httpProxyPort = v;
+                continue;
+            }
+            if (field.startsWith('pp-https=')) {
+                const v = parseInt(field.slice('pp-https='.length), 10);
+                if (Number.isInteger(v) && v >= 1 && v <= 65535) httpsProxyPort = v;
+                continue;
+            }
+            if (field.startsWith('pp-extra=')) {
+                for (const p of field.slice('pp-extra='.length).split(',')) {
+                    const v = parseInt(p, 10);
+                    if (Number.isInteger(v) && v >= 1 && v <= 65535) ppExtra.add(v);
+                }
+                continue;
+            }
             if (!field.startsWith('extra:')) continue;
             const segments = field.split(':');
             if (segments.length !== 4) continue;
@@ -211,8 +244,15 @@ function parseDomainsMap() {
                 mode: segments[3]
             });
         }
+        if (extraPorts) {
+            for (const ep of extraPorts) ep.proxy_protocol = ppExtra.has(ep.listen) ? 'v2' : 'none';
+        }
+        if (proxyProtocol !== 'v2') { httpProxyPort = null; httpsProxyPort = null; }
 
-        entries.push({ domain, container, http_port: httpPort, https_port: httpsPort, map_port: mapPort, extra_ports: extraPorts });
+        entries.push({
+            domain, container, http_port: httpPort, https_port: httpsPort, map_port: mapPort, extra_ports: extraPorts,
+            proxy_protocol: proxyProtocol, http_proxy_port: httpProxyPort, https_proxy_port: httpsProxyPort
+        });
     }
 
     return { lines, entries };
@@ -226,10 +266,23 @@ function entryToMapLine(entry) {
 
     const hasExtra = entry.extra_ports && entry.extra_ports.length > 0;
 
+    // PROXY protocol option tokens. They are written AFTER the extras so that an
+    // older generator/API (rollback) skips them as unrecognized fields.
+    const ppTokens = [];
+    if (entry.proxy_protocol === 'v2') {
+        ppTokens.push('pp=v2');
+        if (entry.http_proxy_port != null) ppTokens.push(`pp-http=${entry.http_proxy_port}`);
+        if (entry.https_proxy_port != null) ppTokens.push(`pp-https=${entry.https_proxy_port}`);
+    }
+    if (hasExtra) {
+        const ppx = entry.extra_ports.filter(ep => ep.proxy_protocol === 'v2').map(ep => ep.listen);
+        if (ppx.length) ppTokens.push(`pp-extra=${ppx.join(',')}`);
+    }
+
     if (entry.map_port != null) {
         line += `\t${entry.map_port}`;
-    } else if (hasExtra) {
-        // Need positional placeholder for map_port when extras follow
+    } else if (hasExtra || ppTokens.length) {
+        // Need positional placeholder for map_port when extras/options follow
         line += '\t-';
     }
 
@@ -238,6 +291,7 @@ function entryToMapLine(entry) {
             line += `\textra:${ep.listen}:${ep.target}:${ep.mode}`;
         }
     }
+    for (const t of ppTokens) line += `\t${t}`;
 
     return line;
 }
@@ -357,16 +411,25 @@ function haproxyAdmin(commands, timeoutMs = 3000) {
 // emits. Server name is always the container name; backend name mirrors the
 // generator (…-http, …-https[-<port>], …-mapdownload, …-extra-<listen>).
 function serverIdsForEntry(entry) {
+    // MUST mirror generate-config.sh naming, including the -pp suffix for
+    // PROXY-v2 servers and the pp-https target override.
     const ids = [];
     const c = entry.container;
-    if (entry.http_port != null) ids.push({ backend: `${c}-http`, server: c });
+    const pp = entry.proxy_protocol === 'v2';
+    if (entry.http_port != null) {
+        const b = !pp ? `${c}-http` : (entry.http_proxy_port != null ? `${c}-http-${entry.http_proxy_port}-pp` : `${c}-http-pp`);
+        ids.push({ backend: b, server: c });
+    }
     if (entry.https_port != null) {
-        const b = entry.https_port === 443 ? `${c}-https` : `${c}-https-${entry.https_port}`;
+        const target = pp && entry.https_proxy_port != null ? entry.https_proxy_port : entry.https_port;
+        const b = (target === 443 ? `${c}-https` : `${c}-https-${target}`) + (pp ? '-pp' : '');
         ids.push({ backend: b, server: c });
     }
     if (entry.map_port != null) ids.push({ backend: `${c}-mapdownload`, server: c });
     if (Array.isArray(entry.extra_ports)) {
-        for (const ep of entry.extra_ports) ids.push({ backend: `${c}-extra-${ep.listen}`, server: c });
+        for (const ep of entry.extra_ports) {
+            ids.push({ backend: `${c}-extra-${ep.listen}${ep.proxy_protocol === 'v2' ? '-pp' : ''}`, server: c });
+        }
     }
     return ids;
 }
@@ -585,6 +648,9 @@ function validateExtraPorts(extraPorts, existingEntries) {
         if (ep.mode !== 'http' && ep.mode !== 'tcp') {
             return { error: `extra_ports[${i}].mode must be "http" or "tcp"`, code: 'VALIDATION_ERROR' };
         }
+        if (ep.proxy_protocol !== undefined && ep.proxy_protocol !== null && !PROXY_PROTOCOL_MODES.has(ep.proxy_protocol)) {
+            return { error: `extra_ports[${i}].proxy_protocol must be "v2" or "none"`, code: 'VALIDATION_ERROR' };
+        }
     }
 
     // Check MODE_CONFLICT across all existing registrations
@@ -615,6 +681,9 @@ function entriesMatch(a, b) {
     if (a.http_port !== b.http_port) return false;
     if (a.https_port !== b.https_port) return false;
     if (a.map_port !== b.map_port) return false;
+    if ((a.proxy_protocol || 'none') !== (b.proxy_protocol || 'none')) return false;
+    if ((a.http_proxy_port ?? null) !== (b.http_proxy_port ?? null)) return false;
+    if ((a.https_proxy_port ?? null) !== (b.https_proxy_port ?? null)) return false;
 
     const aExtra = a.extra_ports || null;
     const bExtra = b.extra_ports || null;
@@ -627,6 +696,7 @@ function entriesMatch(a, b) {
         if (aExtra[i].listen !== bExtra[i].listen) return false;
         if (aExtra[i].target !== bExtra[i].target) return false;
         if (aExtra[i].mode !== bExtra[i].mode) return false;
+        if ((aExtra[i].proxy_protocol || 'none') !== (bExtra[i].proxy_protocol || 'none')) return false;
     }
     return true;
 }
@@ -640,6 +710,9 @@ function entryToResponse(entry, registrations) {
         https_port: entry.https_port,
         map_port: entry.map_port || null,
         extra_ports: entry.extra_ports || null,
+        proxy_protocol: entry.proxy_protocol || 'none',
+        http_proxy_port: entry.http_proxy_port ?? null,
+        https_proxy_port: entry.https_proxy_port ?? null,
         created_at: meta?.created_at || null
     };
 }
@@ -705,7 +778,36 @@ async function handleRegister(req, res) {
     const httpPort = body.http_port === undefined ? 80 : body.http_port;
     const httpsPort = body.https_port === undefined ? 443 : body.https_port;
     const mapPort = body.map_port === undefined ? null : body.map_port;
-    const extraPorts = body.extra_ports === undefined ? null : body.extra_ports;
+    const extraPortsRaw = body.extra_ports === undefined ? null : body.extra_ports;
+
+    // PROXY protocol (optional; absent/null => "none", the pre-PROXY behaviour)
+    const proxyProtocol = body.proxy_protocol === undefined || body.proxy_protocol === null ? 'none' : body.proxy_protocol;
+    if (!PROXY_PROTOCOL_MODES.has(proxyProtocol)) {
+        return sendJson(res, 422, { error: "Field 'proxy_protocol' must be \"v2\" or \"none\"", code: 'VALIDATION_ERROR' });
+    }
+    // http_proxy_port / https_proxy_port: where haproxy sends traffic WHILE the
+    // PROXY header is in effect (a PROXY-aware listener). http_port / https_port
+    // remain the non-PROXY targets, which is what a pre-PROXY haproxy (rollback)
+    // keeps using -- so a listener that *requires* the header is never hit
+    // without one.
+    const httpProxyPort = body.http_proxy_port === undefined ? null : body.http_proxy_port;
+    const httpsProxyPort = body.https_proxy_port === undefined ? null : body.https_proxy_port;
+    for (const [val, name, base] of [[httpProxyPort, 'http_proxy_port', 'http_port'], [httpsProxyPort, 'https_proxy_port', 'https_port']]) {
+        const err = validatePort(val, name);
+        if (err) return sendJson(res, 422, { error: err, code: 'VALIDATION_ERROR' });
+        if (val !== null && proxyProtocol !== 'v2') {
+            return sendJson(res, 422, { error: `Field '${name}' requires proxy_protocol "v2"`, code: 'VALIDATION_ERROR' });
+        }
+        if (val !== null && body[base] === null) {
+            return sendJson(res, 422, { error: `Field '${name}' requires a non-null ${base}`, code: 'VALIDATION_ERROR' });
+        }
+    }
+    // Normalise extras: carry proxy_protocol explicitly ("none" when omitted).
+    const extraPorts = Array.isArray(extraPortsRaw)
+        ? extraPortsRaw.map(ep => (ep && typeof ep === 'object')
+            ? { listen: ep.listen, target: ep.target, mode: ep.mode, proxy_protocol: ep.proxy_protocol ?? 'none' }
+            : ep)
+        : extraPortsRaw;
 
     for (const [val, name] of [[httpPort, 'http_port'], [httpsPort, 'https_port'], [mapPort, 'map_port']]) {
         const err = validatePort(val, name);
@@ -724,7 +826,7 @@ async function handleRegister(req, res) {
     // validateExtraPorts.) This is stricter than the allowlist below, which treats 80/443
     // as always-allowed base ports.
     const INTERNAL_ONLY_PORTS = new Set([8000, 8404]);
-    for (const [val, name] of [[httpPort, 'http_port'], [httpsPort, 'https_port'], [mapPort, 'map_port']]) {
+    for (const [val, name] of [[httpPort, 'http_port'], [httpsPort, 'https_port'], [mapPort, 'map_port'], [httpProxyPort, 'http_proxy_port'], [httpsProxyPort, 'https_proxy_port']]) {
         if (val !== null && INTERNAL_ONLY_PORTS.has(val)) {
             return sendJson(res, 422, {
                 error: `${name} ${val} is reserved for haproxy internal use and cannot be a backend target`,
@@ -739,6 +841,9 @@ async function handleRegister(req, res) {
     // binds or publishes — so allowlisting it governs nothing host-exposed, and doing so
     // would reject legitimate backends whose internal HTTP port isn't curated (e.g. the
     // concierge backend's 8080). https_port / map_port / extra_ports ARE listen ports.
+    // http_proxy_port / https_proxy_port are likewise backend TARGETs (the PROXY-aware TLS listener
+    // :443 SNI traffic is sent to), never bound or published by haproxy, so it is
+    // not allowlist-checked either (it IS subject to the internal-port guard above).
     if (ALLOWED_PORTS) {
         for (const [val, name] of [[httpsPort, 'https_port'], [mapPort, 'map_port']]) {
             if (val !== null && !RESERVED_PORTS.has(val) && !ALLOWED_PORTS.has(val)) {
@@ -756,7 +861,10 @@ async function handleRegister(req, res) {
         http_port: httpPort,
         https_port: httpsPort,
         map_port: mapPort,
-        extra_ports: extraPorts
+        extra_ports: extraPorts,
+        proxy_protocol: proxyProtocol,
+        http_proxy_port: httpProxyPort,
+        https_proxy_port: httpsProxyPort
     };
 
     // Acquire lock and read current state
@@ -1062,7 +1170,7 @@ async function handleHealth(req, res) {
             return sendJson(res, 503, {
                 status: 'unhealthy',
                 error: 'HAProxy master process not found',
-                api_version: '1.0'
+                api_version: API_VERSION
             });
         }
 
@@ -1098,7 +1206,8 @@ async function handleHealth(req, res) {
         const resp = {
             status,
             haproxy_pid: masterPid,
-            api_version: '1.0',
+            api_version: API_VERSION,
+            features: API_FEATURES,
             backends_count: entries.length
         };
 
@@ -1116,7 +1225,7 @@ async function handleHealth(req, res) {
         return sendJson(res, 500, {
             status: 'unhealthy',
             error: `Health check failed: ${err.message}`,
-            api_version: '1.0'
+            api_version: API_VERSION
         });
     }
 }
@@ -1171,7 +1280,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`[registration-api] Registration API v1.0 listening on port ${PORT}`);
+    console.log(`[registration-api] Registration API v${API_VERSION} listening on port ${PORT}`);
     console.log(`[registration-api] domains.map: ${DOMAINS_MAP}`);
     console.log(`[registration-api] conf.d: ${CONF_DIR}`);
     console.log(`[registration-api] Authentication: ${API_KEY ? 'enabled' : 'disabled'}`);

@@ -84,6 +84,12 @@ case "${SERVICE}" in
         echo "API service ready on ports 8080 (HTTP), 8443 (HTTPS)"
         ;;
 
+    ppecho)
+        # PROXY-v2-aware listeners: :80 HTTP, :8445 PROXY+TLS, :50005 PROXY+TCP
+        node /pp-echo-server.mjs &
+        echo "PROXY echo service ready on ports 80, 8445, 50005"
+        ;;
+
     *)
         echo "Unknown SERVICE_TYPE: ${SERVICE}"
         exit 1

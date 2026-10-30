@@ -114,6 +114,12 @@ rm -f "${MAPS_DIR}"/extra-*-domains.map
 # State tracking
 # ---------------------------------------------------------------------------
 
+# Server-line options for a PROXY-v2 backend. check-send-proxy makes the health
+# check carry the header too (haproxy's default for send-proxy servers anyway, but
+# explicit so a future `port`/`addr` on the check cannot silently drop it): a
+# PROXY-aware listener that *requires* the header must still pass its checks.
+readonly PP_SERVER_OPTS=" send-proxy-v2 check-send-proxy"
+
 # Track if any map_port entries exist
 has_mapdownload=false
 
@@ -146,6 +152,62 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     https_port="${fields[3]:-}"
     map_port="${fields[4]:-}"
 
+    # PROXY protocol option tokens (see docs/PROXY-PROTOCOL-V2-DESIGN.md):
+    #   pp=v2             send PROXY v2 on the http_port and https server lines
+    #   pp-http=<port>    with pp=v2, :80 traffic targets this (PROXY-aware) port
+    #                     instead of http_port
+    #   pp-https=<port>   with pp=v2, :443 SNI traffic targets this (PROXY-aware) port
+    #                     instead of https_port
+    #   (http_port/https_port stay the non-PROXY fallback a pre-PROXY haproxy uses)
+    #   pp-extra=<l>[,<l>] send PROXY v2 to the extra port(s) with these listen ports
+    # Tokens live AFTER the positional map_port column (writers always emit a '-'
+    # placeholder there), so pre-PROXY generators/APIs ignore them ("unrecognized
+    # field") -- which is what makes a rollback of this image safe. A pp token found
+    # in the map_port column itself (hand edit) is accepted and map_port is unset.
+    pp_mode="none"
+    pp_http=""
+    pp_https=""
+    declare -A PP_EXTRA=()
+    opt_start=5
+    if [[ "$map_port" == pp=* || "$map_port" == pp-* ]]; then
+        map_port=""
+        opt_start=4
+    fi
+    for (( i=opt_start; i<${#fields[@]}; i++ )); do
+        opt="${fields[$i]}"
+        case "$opt" in
+            pp=v2) pp_mode="v2" ;;
+            pp=none) pp_mode="none" ;;
+            pp=*) echo "Warning: Ignoring unsupported PROXY protocol mode '${opt}' for ${domain}" >&2 ;;
+            pp-http=*)
+                v="${opt#pp-http=}"
+                if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )); then
+                    pp_http="$v"
+                else
+                    echo "Warning: Ignoring invalid '${opt}' for ${domain}" >&2
+                fi
+                ;;
+            pp-https=*)
+                v="${opt#pp-https=}"
+                if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )); then
+                    pp_https="$v"
+                else
+                    echo "Warning: Ignoring invalid '${opt}' for ${domain}" >&2
+                fi
+                ;;
+            pp-extra=*)
+                IFS=',' read -ra _ppx <<< "${opt#pp-extra=}"
+                for v in "${_ppx[@]}"; do
+                    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )); then
+                        PP_EXTRA["$v"]=1
+                    else
+                        echo "Warning: Ignoring invalid pp-extra port '${v}' for ${domain}" >&2
+                    fi
+                done
+                ;;
+        esac
+    done
+
     # Validate we have required fields
     if [[ -z "$domain" || -z "$container" || -z "$http_port" || -z "$https_port" ]]; then
         echo "Warning: Skipping invalid line: $line"
@@ -171,7 +233,19 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
     # Generate HTTP map entry and backend (skip if port is -)
     if [[ "$http_port" != "-" ]]; then
+        # A PROXY-v2 server gets its own backend name (…-pp) so a domain that sends
+        # the header can never share a backend block with one that must not.
         http_backend="${container}-http"
+        http_target="$http_port"
+        http_srv_opts=""
+        if [[ "$pp_mode" == "v2" ]]; then
+            http_backend="${container}-http-pp"
+            if [[ -n "$pp_http" ]]; then
+                http_target="$pp_http"
+                http_backend="${container}-http-${pp_http}-pp"
+            fi
+            http_srv_opts="$PP_SERVER_OPTS"
+        fi
         printf '%s    %s\n' "$domain" "$http_backend" >> "${MAPS_DIR}/http-domains.map"
         # Only generate backend block once per unique name
         if [[ -z "${SEEN_BACKENDS[${http_backend}]:-}" ]]; then
@@ -180,7 +254,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
 backend ${http_backend}
     mode http
-    server ${container} ${container}:${http_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
+    server ${container} ${container}:${http_target} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2${http_srv_opts}
 EOF
         fi
     fi
@@ -190,11 +264,18 @@ EOF
     # multiple domains on the same container with different HTTPS ports
     # (e.g., primary on 443, alias via ssl-alias-proxy on 8444)
     if [[ "$https_port" != "-" ]]; then
-        if [[ "$https_port" == "443" ]]; then
+        https_target="$https_port"
+        https_srv_opts=""
+        if [[ "$pp_mode" == "v2" ]]; then
+            [[ -n "$pp_https" ]] && https_target="$pp_https"
+            https_srv_opts="$PP_SERVER_OPTS"
+        fi
+        if [[ "$https_target" == "443" ]]; then
             https_backend="${container}-https"
         else
-            https_backend="${container}-https-${https_port}"
+            https_backend="${container}-https-${https_target}"
         fi
+        [[ "$pp_mode" == "v2" ]] && https_backend="${https_backend}-pp"
         printf '%s    %s\n' "$domain" "$https_backend" >> "${MAPS_DIR}/https-domains.map"
         if [[ -z "${SEEN_BACKENDS[${https_backend}]:-}" ]]; then
             SEEN_BACKENDS["${https_backend}"]=1
@@ -202,7 +283,7 @@ EOF
 
 backend ${https_backend}
     mode tcp
-    server ${container} ${container}:${https_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
+    server ${container} ${container}:${https_target} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2${https_srv_opts}
 EOF
         fi
     fi
@@ -226,6 +307,9 @@ EOF
     # Parse extra port fields (fields 6+, index 5+)
     for (( i=5; i<${#fields[@]}; i++ )); do
         extra_field="${fields[$i]}"
+
+        # PROXY protocol option tokens were consumed above
+        [[ "$extra_field" == pp=* || "$extra_field" == pp-* ]] && continue
 
         # Extra port fields must start with "extra:"
         if [[ "$extra_field" != extra:* ]]; then
@@ -257,8 +341,13 @@ EOF
         EXTRA_LISTEN_PORTS["$listen_port"]="$extra_mode"
         has_extra_ports=true
 
-        # Backend name format: <container>-extra-<listen>
+        # Backend name format: <container>-extra-<listen>[-pp]
         local_backend="${container}-extra-${listen_port}"
+        extra_srv_opts=""
+        if [[ -n "${PP_EXTRA[$listen_port]:-}" ]]; then
+            local_backend="${local_backend}-pp"
+            extra_srv_opts="$PP_SERVER_OPTS"
+        fi
 
         # Add map entry for this port
         if [[ -n "${EXTRA_MAP_ENTRIES[$listen_port]:-}" ]]; then
@@ -279,14 +368,14 @@ EOF
 
 backend ${local_backend}
     mode http
-    server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
+    server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2${extra_srv_opts}
 EOF
             else
                 cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
 backend ${local_backend}
     mode tcp
-    server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2
+    server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2${extra_srv_opts}
 EOF
             fi
         fi
@@ -307,6 +396,14 @@ EOF
     done
     if (( extra_count > 0 )); then
         msg+=", Extra:${extra_count}"
+    fi
+    if [[ "$pp_mode" == "v2" ]]; then
+        msg+=", PROXYv2"
+        [[ -n "$pp_http" ]] && msg+="(http->${pp_http})"
+        [[ -n "$pp_https" ]] && msg+="(https->${pp_https})"
+    fi
+    if (( ${#PP_EXTRA[@]} > 0 )); then
+        msg+=", PROXYv2-extra:$(printf '%s\n' "${!PP_EXTRA[@]}" | sort -n | paste -sd, -)"
     fi
     msg+=")"
     echo "$msg"

@@ -19,12 +19,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # ─── Constants ─────────────────────────────────────────────────
-TEST_PREFIX="haproxy-e2e-test"
+# Overridable so a run on a shared host can use a provably unique prefix.
+TEST_PREFIX="${TEST_PREFIX:-haproxy-e2e-test}"
 TEST_NET="${TEST_PREFIX}-net"
 TEST_HAPROXY="${TEST_PREFIX}-proxy"
 TEST_WEB="${TEST_PREFIX}-web"
 TEST_ELECTRUM="${TEST_PREFIX}-electrum"
 TEST_API="${TEST_PREFIX}-api"
+TEST_PP="${TEST_PREFIX}-ppecho"
 TEST_IMAGE="${TEST_PREFIX}-service:latest"
 HAPROXY_IMAGE="${TEST_PREFIX}-haproxy:latest"
 
@@ -1240,6 +1242,175 @@ suite_auth_and_rate_limiting() {
     run_test "HAPROXY_API_KEY enforces Bearer auth (401/201)" test_api_key_auth
 }
 
+suite_proxy_protocol() {
+    run_suite "14. PROXY protocol v2"
+    # NOTE: every assertion below ends in `|| return 1`. run_test invokes the test
+    # inside an `if`, which disables errexit, so without the guard only the LAST
+    # assertion of a test would decide PASS/FAIL.
+
+    docker run -d --name "${TEST_PP}" --network "${TEST_NET}" \
+        -e SERVICE_TYPE=ppecho -e TEST_DOMAIN=pp.test.local \
+        "${TEST_IMAGE}" >/dev/null
+    for _i in $(seq 1 20); do
+        docker exec "${TEST_PP}" sh -c 'nc -z 127.0.0.1 80 && nc -z 127.0.0.1 8445 && nc -z 127.0.0.1 50005' >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+
+    local haproxy_ip client_ip
+    haproxy_ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"${TEST_NET}\").IPAddress}}" "${TEST_HAPROXY}")
+    client_ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"${TEST_NET}\").IPAddress}}" "${TEST_WEB}")
+
+    api() { curl -s -w "\n%{http_code}" "$@"; }
+
+    test_pp_validation() {
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${API_PORT}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d '{"domain":"bad.pp.test.local","container":"'"${TEST_PP}"'","proxy_protocol":"v1"}')
+        assert_equals "422" "$code" "proxy_protocol v1 is rejected" || return 1
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${API_PORT}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d '{"domain":"bad.pp.test.local","container":"'"${TEST_PP}"'","https_proxy_port":8445}')
+        assert_equals "422" "$code" "https_proxy_port without proxy_protocol v2 is rejected" || return 1
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${API_PORT}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d '{"domain":"bad.pp.test.local","container":"'"${TEST_PP}"'","proxy_protocol":"v2","https_proxy_port":8404}')
+        assert_equals "422" "$code" "https_proxy_port may not target the internal API port" || return 1
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${API_PORT}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d '{"domain":"bad.pp.test.local","container":"'"${TEST_PP}"'","extra_ports":[{"listen":50005,"target":50005,"mode":"tcp","proxy_protocol":"yes"}]}')
+        assert_equals "422" "$code" "extra_ports[].proxy_protocol must be v2|none" || return 1
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${API_PORT}/v1/backends" \
+            -H "Content-Type: application/json" \
+            -d '{"domain":"bad.pp.test.local","container":"'"${TEST_PP}"'","http_proxy_port":8081}')
+        assert_equals "422" "$code" "http_proxy_port without proxy_protocol v2 is rejected" || return 1
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X GET "http://127.0.0.1:${API_PORT}/v1/backends/bad.pp.test.local")
+        assert_equals "404" "$code" "rejected registrations leave no trace" || return 1
+    }
+    run_test "PROXY fields are validated (422)" test_pp_validation
+
+    test_pp_register() {
+        local response code body
+        response=$(api -X POST "http://127.0.0.1:${API_PORT}/v1/backends" -H "Content-Type: application/json" \
+            -d '{"domain":"pp.test.local","container":"'"${TEST_PP}"'","http_port":80,"https_port":443,"proxy_protocol":"v2","https_proxy_port":8445,"extra_ports":[{"listen":50005,"target":50005,"mode":"tcp","proxy_protocol":"v2"}]}')
+        code=$(echo "$response" | tail -1); body=$(echo "$response" | sed '$d')
+        assert_equals "201" "$code" "PROXY registration accepted" || return 1
+        assert_equals "v2" "$(echo "$body" | jq -r '.proxy_protocol')" "response echoes proxy_protocol" || return 1
+        assert_equals "8445" "$(echo "$body" | jq -r '.https_proxy_port')" "response echoes https_proxy_port" || return 1
+        assert_equals "v2" "$(echo "$body" | jq -r '.extra_ports[0].proxy_protocol')" "response echoes extra proxy_protocol" || return 1
+        sleep 5
+        local line
+        line=$(docker exec "${TEST_HAPROXY}" grep '^pp.test.local' /etc/haproxy/domains.map)
+        assert_contains "$line" "pp=v2" "domains.map persists pp=v2" || return 1
+        assert_contains "$line" "pp-https=8445" "domains.map persists pp-https" || return 1
+        assert_contains "$line" "pp-extra=50005" "domains.map persists pp-extra" || return 1
+        local web_line
+        web_line=$(docker exec "${TEST_HAPROXY}" grep '^web.test.local' /etc/haproxy/domains.map)
+        if echo "$web_line" | grep -qE '[[:space:]]pp(=|-)'; then echo "legacy entry gained a pp token: $web_line" >&2; return 1; fi
+        # idempotent with identical PROXY config
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${API_PORT}/v1/backends" -H "Content-Type: application/json" \
+            -d '{"domain":"pp.test.local","container":"'"${TEST_PP}"'","http_port":80,"https_port":443,"proxy_protocol":"v2","https_proxy_port":8445,"extra_ports":[{"listen":50005,"target":50005,"mode":"tcp","proxy_protocol":"v2"}]}')
+        assert_equals "200" "$code" "identical PROXY re-registration is idempotent" || return 1
+    }
+    run_test "Register with proxy_protocol v2 (persisted in domains.map)" test_pp_register
+
+    test_pp_http_real_ip() {
+        local out
+        out=$(docker exec "${TEST_WEB}" curl -s --max-time 5 -H "Host: pp.test.local" -H "X-Forwarded-For: 6.6.6.6" "http://${haproxy_ip}/")
+        assert_equals "true" "$(echo "$out" | jq -r '.pp')" "HTTP :80 backend received a PROXY v2 header ($out)" || return 1
+        assert_equals "${client_ip}" "$(echo "$out" | jq -r '.src' | cut -d: -f1)" "header carries the real client IP" || return 1
+        assert_equals "${haproxy_ip}" "$(echo "$out" | jq -r '.peer' | sed 's/^::ffff://' | cut -d: -f1)" "TCP peer is haproxy" || return 1
+    }
+    run_test "HTTP :80 -> backend sees real client IP via PROXY v2" test_pp_http_real_ip
+
+    test_pp_tls_real_ip() {
+        local out
+        out=$(docker exec "${TEST_WEB}" curl -sk --max-time 5 --resolve "pp.test.local:443:${haproxy_ip}" "https://pp.test.local/")
+        assert_equals "true" "$(echo "$out" | jq -r '.tls')" "TLS passthrough reached the shim port ($out)" || return 1
+        assert_equals "true" "$(echo "$out" | jq -r '.pp')" "TLS-SNI passthrough carried a PROXY v2 header" || return 1
+        assert_equals "${client_ip}" "$(echo "$out" | jq -r '.src' | cut -d: -f1)" "header carries the real client IP" || return 1
+    }
+    run_test "TLS-SNI :443 passthrough -> real client IP via PROXY v2" test_pp_tls_real_ip
+
+    test_pp_tcp_extra() {
+        local out
+        out=$(docker exec "${TEST_WEB}" sh -c "printf 'hi\n' | nc -w 3 ${haproxy_ip} 50005")
+        assert_equals "true" "$(echo "$out" | jq -r '.pp')" "extra TCP port carried a PROXY v2 header ($out)" || return 1
+        assert_equals "${client_ip}" "$(echo "$out" | jq -r '.src' | cut -d: -f1)" "extra TCP port: real client IP" || return 1
+    }
+    run_test "Extra TCP port with proxy_protocol v2 -> real client IP" test_pp_tcp_extra
+
+    test_pp_legacy_untouched() {
+        local out
+        out=$(docker exec "${TEST_PP}" curl -s --max-time 5 -H "Host: web.test.local" "http://${haproxy_ip}/")
+        assert_equals "web" "$(echo "$out" | jq -r '.service' 2>/dev/null)" "legacy backend (no flag) still served ($out)" || return 1
+        if docker exec "${TEST_HAPROXY}" grep -A2 "^backend ${TEST_WEB}-http\$" /etc/haproxy/conf.d/20-backends.cfg | grep -q send-proxy; then
+            echo "legacy backend got send-proxy" >&2; return 1
+        fi
+    }
+    run_test "Backend registered without the flag gets no header" test_pp_legacy_untouched
+
+    test_pp_health_up() {
+        local stat
+        sleep 3
+        stat=$(docker exec "${TEST_HAPROXY}" sh -c 'echo "show stat" | socat stdio /var/run/haproxy.sock' | cut -d, -f1,2,18)
+        assert_contains "$stat" "${TEST_PP}-http-pp,${TEST_PP},UP" "http-pp server health check UP (checks carry the header)" || return 1
+        assert_contains "$stat" "${TEST_PP}-https-8445-pp,${TEST_PP},UP" "https shim server health check UP" || return 1
+        assert_contains "$stat" "${TEST_PP}-extra-50005-pp,${TEST_PP},UP" "extra-pp server health check UP" || return 1
+    }
+    run_test "haproxy health checks of PROXY backends are UP" test_pp_health_up
+
+    test_pp_persist_restart() {
+        docker restart "${TEST_HAPROXY}" >/dev/null
+        wait_for_healthy "${TEST_HAPROXY}" 30 >/dev/null
+        haproxy_ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"${TEST_NET}\").IPAddress}}" "${TEST_HAPROXY}")
+        assert_equals "v2" "$(curl -s "http://127.0.0.1:$(docker port "${TEST_HAPROXY}" 8404/tcp | head -1 | sed 's/.*://')/v1/backends/pp.test.local" | jq -r '.proxy_protocol')" "registration survives restart" || return 1
+        local out=""
+        for _i in $(seq 1 10); do
+            out=$(docker exec "${TEST_WEB}" curl -s --max-time 3 -H "Host: pp.test.local" "http://${haproxy_ip}/" || true)
+            [ "$(echo "$out" | jq -r '.pp' 2>/dev/null)" = "true" ] && break
+            sleep 1
+        done
+        assert_equals "true" "$(echo "$out" | jq -r '.pp')" "header still sent after restart ($out)" || return 1
+        # restore port discovery for any later suites
+        API_PORT=$(docker port "${TEST_HAPROXY}" 8404/tcp | head -1 | sed 's/.*://')
+        HTTP_PORT=$(docker port "${TEST_HAPROXY}" 80/tcp | head -1 | sed 's/.*://')
+        HTTPS_PORT=$(docker port "${TEST_HAPROXY}" 443/tcp | head -1 | sed 's/.*://')
+    }
+    run_test "PROXY registration persists across haproxy restart" test_pp_persist_restart
+
+    test_pp_drain_names() {
+        # kick/drain address servers by name: the -pp naming must match the generator
+        local code stat
+        # unauthenticated drain must come from the registered container itself
+        code=$(docker exec "${TEST_PP}" curl -s -o /dev/null -w "%{http_code}" -X POST "http://${TEST_HAPROXY}:8404/v1/backends/pp.test.local/drain")
+        assert_equals "200" "$code" "drain accepted" || return 1
+        stat=$(docker exec "${TEST_HAPROXY}" sh -c 'echo "show stat" | socat stdio /var/run/haproxy.sock' | cut -d, -f1,2,18)
+        assert_contains "$stat" "${TEST_PP}-http-pp,${TEST_PP},MAINT" "drain reached the http-pp server" || return 1
+        assert_contains "$stat" "${TEST_PP}-https-8445-pp,${TEST_PP},MAINT" "drain reached the https shim server" || return 1
+        assert_contains "$stat" "${TEST_PP}-extra-50005-pp,${TEST_PP},MAINT" "drain reached the extra-pp server" || return 1
+        # identical re-registration kicks them READY again
+        curl -s -o /dev/null -X POST "http://127.0.0.1:${API_PORT}/v1/backends" -H "Content-Type: application/json" \
+            -d '{"domain":"pp.test.local","container":"'"${TEST_PP}"'","http_port":80,"https_port":443,"proxy_protocol":"v2","https_proxy_port":8445,"extra_ports":[{"listen":50005,"target":50005,"mode":"tcp","proxy_protocol":"v2"}]}'
+        sleep 1
+        stat=$(docker exec "${TEST_HAPROXY}" sh -c 'echo "show stat" | socat stdio /var/run/haproxy.sock' | cut -d, -f1,2,18)
+        if echo "$stat" | grep "^${TEST_PP}-" | grep -q MAINT; then echo "still MAINT after re-announce: $stat" >&2; return 1; fi
+    }
+    run_test "Drain/kick address the -pp servers (name parity)" test_pp_drain_names
+
+    test_pp_downgrade() {
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${API_PORT}/v1/backends" -H "Content-Type: application/json" \
+            -d '{"domain":"pp.test.local","container":"'"${TEST_PP}"'","http_port":80,"https_port":443}')
+        assert_equals "200" "$code" "re-registration without the flag updates the entry" || return 1
+        sleep 5
+        local out
+        out=$(docker exec "${TEST_WEB}" curl -s --max-time 5 -H "Host: pp.test.local" "http://${haproxy_ip}/")
+        assert_equals "false" "$(echo "$out" | jq -r '.pp')" "header no longer sent after downgrade ($out)" || return 1
+    }
+    run_test "Re-registering without the flag stops the header (rollback)" test_pp_downgrade
+}
+
 # ─── Main ──────────────────────────────────────────────────────
 
 main() {
@@ -1271,6 +1442,7 @@ main() {
         suite_concurrent_registration
         suite_container_ownership
         suite_auth_and_rate_limiting
+        suite_proxy_protocol
     else
         "suite_${target_suite}" 2>/dev/null || {
             echo "Unknown suite: ${target_suite}" >&2
@@ -1278,7 +1450,7 @@ main() {
             echo "  http_routing, tls_passthrough, extra_ports, websocket," >&2
             echo "  unregistration, reload_under_load, error_handling," >&2
             echo "  concurrent_registration, container_ownership," >&2
-            echo "  auth_and_rate_limiting" >&2
+            echo "  auth_and_rate_limiting, proxy_protocol" >&2
             exit 1
         }
     fi
