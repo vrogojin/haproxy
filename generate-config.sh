@@ -118,7 +118,18 @@ rm -f "${MAPS_DIR}"/extra-*-domains.map
 # check carry the header too (haproxy's default for send-proxy servers anyway, but
 # explicit so a future `port`/`addr` on the check cannot silently drop it): a
 # PROXY-aware listener that *requires* the header must still pass its checks.
-readonly PP_SERVER_OPTS=" send-proxy-v2 check-send-proxy"
+# resolve-opts allow-dup-ip: the -pp backend's primary and its "-plain" backup
+# resolve the SAME container name; without this haproxy's resolver refuses to
+# hand one IP to two servers of a backend and parks one in MAINT (resolution).
+readonly PP_SERVER_OPTS=" send-proxy-v2 check-send-proxy resolve-opts allow-dup-ip"
+
+# Every -pp backend also gets a header-less BACKUP server on the plain port
+# (http_port / https_port / extra target). If the PROXY-aware listener dies (e.g.
+# the ssl-manager TLS shim), haproxy fails over to the plain path after the
+# health check marks the primary DOWN, instead of black-holing the domain.
+pp_backup_line() {  # <container> <plain-port>
+    printf '    server %s-plain %s:%s resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2 resolve-opts allow-dup-ip backup\n' "$1" "$1" "$2"
+}
 
 # Track if any map_port entries exist
 has_mapdownload=false
@@ -256,6 +267,7 @@ backend ${http_backend}
     mode http
     server ${container} ${container}:${http_target} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2${http_srv_opts}
 EOF
+            [[ "$pp_mode" == "v2" ]] && pp_backup_line "$container" "$http_port" >> "${CONF_DIR}/20-backends.cfg"
         fi
     fi
 
@@ -285,6 +297,7 @@ backend ${https_backend}
     mode tcp
     server ${container} ${container}:${https_target} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2${https_srv_opts}
 EOF
+            [[ "$pp_mode" == "v2" ]] && pp_backup_line "$container" "$https_port" >> "${CONF_DIR}/20-backends.cfg"
         fi
     fi
 
@@ -370,6 +383,7 @@ backend ${local_backend}
     mode http
     server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2${extra_srv_opts}
 EOF
+                [[ -n "$extra_srv_opts" ]] && pp_backup_line "$container" "$target_port" >> "${CONF_DIR}/20-backends.cfg"
             else
                 cat >> "${CONF_DIR}/20-backends.cfg" << EOF
 
@@ -377,6 +391,7 @@ backend ${local_backend}
     mode tcp
     server ${container} ${container}:${target_port} resolvers docker resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 3 rise 2${extra_srv_opts}
 EOF
+                [[ -n "$extra_srv_opts" ]] && pp_backup_line "$container" "$target_port" >> "${CONF_DIR}/20-backends.cfg"
             fi
         fi
     done

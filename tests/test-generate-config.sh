@@ -369,9 +369,19 @@ EOF
     # pp=v2 + pp-https: http -> :80 with header, https -> shim port with header
     assert_file_contains "${TMPDIR}/maps/http-domains.map" "pp\\.example\\.com +pp-svc-http-pp$" "pp http map -> -pp backend"
     assert_file_contains "${TMPDIR}/maps/https-domains.map" "pp\\.example\\.com +pp-svc-https-8445-pp$" "pp https map -> shim backend"
-    assert_file_contains "$be" "server pp-svc pp-svc:80 .* send-proxy-v2 check-send-proxy$" "pp http server sends PROXY v2"
-    assert_file_contains "$be" "server pp-svc pp-svc:8445 .* send-proxy-v2 check-send-proxy$" "pp https server targets shim with PROXY v2"
+    assert_file_contains "$be" "server pp-svc pp-svc:80 .* send-proxy-v2 check-send-proxy resolve-opts allow-dup-ip$" "pp http server sends PROXY v2"
+    assert_file_contains "$be" "server pp-svc pp-svc:8445 .* send-proxy-v2 check-send-proxy resolve-opts allow-dup-ip$" "pp https server targets shim with PROXY v2"
     assert_file_not_contains "$be" "server pp-svc pp-svc:443" "pp https never targets the raw app port"
+
+    # every -pp backend has a header-less backup on the PLAIN port (M5)
+    assert_file_contains "$be" "server pp-svc-plain pp-svc:443 .* backup$" "https-pp backend has plain backup -> https_port"
+    assert_file_contains "$be" "server pp-svc-plain pp-svc:80 .* backup$" "http-pp backend has plain backup -> http_port"
+    assert_file_not_contains "$be" "server [a-z0-9-]+-plain .*send-proxy" "backup servers never send PROXY"
+    assert_file_contains "$be" "server pp-svc-plain .* resolve-opts allow-dup-ip backup$" "backup may share the primary's IP (else MAINT resolution)"
+    assert_file_contains "$be" "server pport-svc-plain pport-svc:80 .* backup$" "pp-http backend falls back to http_port"
+    assert_file_contains "$be" "server pport-svc-plain pport-svc:443 .* backup$" "pp-https backend falls back to https_port"
+    assert_file_contains "$be" "server ppx-svc-plain ppx-svc:50001 .* backup$" "extra-pp backend has a plain backup"
+    assert_file_not_contains "$be" "server legacy-svc-plain" "legacy entries get no backup server"
 
     # pp=v2 without pp-https: header goes to the port itself (http-only entry here)
     assert_file_contains "$be" "server pphttp-svc pphttp-svc:80 .* send-proxy-v2" "pp http-only entry sends PROXY v2"
@@ -411,6 +421,11 @@ EOF
     run_generate "$map_file"
     local be="${TMPDIR}/conf.d/20-backends.cfg"
     assert_file_contains "$be" "^backend bad-svc-http$" "unsupported pp mode falls back to plain backend"
+    cat > "$map_file" << 'EOF'
+last.example.com  last-svc  80  443  -  pp=v2  pp=none
+EOF
+    run_generate "$map_file"
+    assert_file_contains "$be" "^backend last-svc-http$" "last pp= token wins (pp=none after pp=v2)"
     assert_file_not_contains "$be" "send-proxy" "no send-proxy for unsupported mode"
 }
 

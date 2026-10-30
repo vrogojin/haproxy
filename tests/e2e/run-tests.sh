@@ -1357,8 +1357,20 @@ suite_proxy_protocol() {
         assert_contains "$stat" "${TEST_PP}-http-pp,${TEST_PP},UP" "http-pp server health check UP (checks carry the header)" || return 1
         assert_contains "$stat" "${TEST_PP}-https-8445-pp,${TEST_PP},UP" "https shim server health check UP" || return 1
         assert_contains "$stat" "${TEST_PP}-extra-50005-pp,${TEST_PP},UP" "extra-pp server health check UP" || return 1
+        # UP alone would also be true without the header (the mock accepts both), so
+        # prove the checks CARRY it: the mock logs every LOCAL header per port.
+        local logs
+        logs=$(docker logs "${TEST_PP}" 2>&1)
+        for port in 80 8445 50005; do
+            assert_contains "$logs" "LOCAL-header port=${port}" "health checks to :${port} carry a PROXY v2 LOCAL header" || return 1
+        done
+        # the header-less backup servers are resolved and health-checked (not parked
+        # in MAINT (resolution)); the mock serves plain :80, so that one must be UP.
+        # (The mock has nothing on plain :443, so that backup is legitimately DOWN.)
+        assert_contains "$stat" "${TEST_PP}-http-pp,${TEST_PP}-plain,UP" "http-pp plain backup server UP" || return 1
+        if echo "$stat" | grep "${TEST_PP}-plain" | grep -q MAINT; then echo "backup server stuck in MAINT: $stat" >&2; return 1; fi
     }
-    run_test "haproxy health checks of PROXY backends are UP" test_pp_health_up
+    run_test "Health checks carry the header and PROXY servers are UP" test_pp_health_up
 
     test_pp_persist_restart() {
         docker restart "${TEST_HAPROXY}" >/dev/null
@@ -1389,6 +1401,7 @@ suite_proxy_protocol() {
         assert_contains "$stat" "${TEST_PP}-http-pp,${TEST_PP},MAINT" "drain reached the http-pp server" || return 1
         assert_contains "$stat" "${TEST_PP}-https-8445-pp,${TEST_PP},MAINT" "drain reached the https shim server" || return 1
         assert_contains "$stat" "${TEST_PP}-extra-50005-pp,${TEST_PP},MAINT" "drain reached the extra-pp server" || return 1
+        assert_contains "$stat" "${TEST_PP}-https-8445-pp,${TEST_PP}-plain,MAINT" "drain reached the plain backup server" || return 1
         # identical re-registration kicks them READY again
         curl -s -o /dev/null -X POST "http://127.0.0.1:${API_PORT}/v1/backends" -H "Content-Type: application/json" \
             -d '{"domain":"pp.test.local","container":"'"${TEST_PP}"'","http_port":80,"https_port":443,"proxy_protocol":"v2","https_proxy_port":8445,"extra_ports":[{"listen":50005,"target":50005,"mode":"tcp","proxy_protocol":"v2"}]}'

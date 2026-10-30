@@ -216,7 +216,9 @@ function parseDomainsMap() {
         const ppExtra = new Set();
         for (let i = extraStartIdx; i < parts.length; i++) {
             const field = parts[i];
+            // last pp= token wins -- same precedence as generate-config.sh
             if (field === 'pp=v2') { proxyProtocol = 'v2'; continue; }
+            if (field === 'pp=none') { proxyProtocol = 'none'; continue; }
             if (field.startsWith('pp-http=')) {
                 const v = parseInt(field.slice('pp-http='.length), 10);
                 if (Number.isInteger(v) && v >= 1 && v <= 65535) httpProxyPort = v;
@@ -413,22 +415,27 @@ function haproxyAdmin(commands, timeoutMs = 3000) {
 function serverIdsForEntry(entry) {
     // MUST mirror generate-config.sh naming, including the -pp suffix for
     // PROXY-v2 servers and the pp-https target override.
+    // Every -pp backend also has a header-less backup server "<c>-plain".
     const ids = [];
     const c = entry.container;
     const pp = entry.proxy_protocol === 'v2';
+    const push = (backend, isPp) => {
+        ids.push({ backend, server: c });
+        if (isPp) ids.push({ backend, server: `${c}-plain` });
+    };
     if (entry.http_port != null) {
         const b = !pp ? `${c}-http` : (entry.http_proxy_port != null ? `${c}-http-${entry.http_proxy_port}-pp` : `${c}-http-pp`);
-        ids.push({ backend: b, server: c });
+        push(b, pp);
     }
     if (entry.https_port != null) {
         const target = pp && entry.https_proxy_port != null ? entry.https_proxy_port : entry.https_port;
-        const b = (target === 443 ? `${c}-https` : `${c}-https-${target}`) + (pp ? '-pp' : '');
-        ids.push({ backend: b, server: c });
+        push((target === 443 ? `${c}-https` : `${c}-https-${target}`) + (pp ? '-pp' : ''), pp);
     }
     if (entry.map_port != null) ids.push({ backend: `${c}-mapdownload`, server: c });
     if (Array.isArray(entry.extra_ports)) {
         for (const ep of entry.extra_ports) {
-            ids.push({ backend: `${c}-extra-${ep.listen}${ep.proxy_protocol === 'v2' ? '-pp' : ''}`, server: c });
+            const epp = ep.proxy_protocol === 'v2';
+            push(`${c}-extra-${ep.listen}${epp ? '-pp' : ''}`, epp);
         }
     }
     return ids;

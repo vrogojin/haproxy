@@ -51,6 +51,9 @@ function withHeader(sock, cb) {
         sock.pause();
         if (r.state === 'bad') return sock.destroy();
         if (r.state === 'none') return cb({ pp: false, src: null }, buf);
+        // haproxy health checks (check-send-proxy) arrive as LOCAL headers; log them
+        // so the e2e can prove the checks really carry the header.
+        if (r.local) console.log(`LOCAL-header port=${sock.localPort}`);
         return cb({ pp: true, src: r.src, local: r.local }, buf.subarray(r.len));
     };
     sock.on('data', onData);
