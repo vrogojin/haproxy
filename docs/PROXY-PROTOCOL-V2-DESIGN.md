@@ -99,9 +99,32 @@ A byte-transparent shim on a separate port gives every app the header-carrying r
 **Trade-off: what the app sees on TLS.** The app sees the **shim's address**, not the client. It used to see haproxy's address, so this is no regression, but it is not the real client IP either. The real client IP is:
 
 - in the shim log, with `SSL_PROXY_LOG_CONNECTIONS=true`;
-- **delivered to the app** if the app opts in with `SSL_PROXY_HTTPS_UPSTREAM=auto:<pp-port>` and `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL=v2` (or v1). The shim then re-emits a PROXY header to a dedicated PROXY listener of the app, for example nginx `listen 8446 ssl proxy_protocol; set_real_ip_from <container-ip>/32; real_ip_header proxy_protocol;`. The e2e test proves this path (`pp_src` = client).
+- **delivered to the app** if the app opts in with `SSL_PROXY_HTTPS_UPSTREAM=127.0.0.1:<pp-port>` and `SSL_PROXY_HTTPS_UPSTREAM_PROTOCOL=v2` (or v1). The shim then re-emits a PROXY header to a dedicated PROXY listener of the app. The e2e test proves this path (`pp_src` = client).
 
-The shim connects to the app via the **container's own non-loopback IP** (`auto:`), never 127.0.0.1. If it used loopback, an app ACL such as `allow 127.0.0.1` or "localhost is admin" would start admitting every internet client.
+**App-side PROXY listener: the only supported nginx pattern.**
+
+```nginx
+server {
+    listen 127.0.0.1:8446 ssl proxy_protocol;  # NOT 0.0.0.0: reachable only from inside the container
+    set_real_ip_from 127.0.0.1/32;              # the shim's source address, and nothing else
+    real_ip_header proxy_protocol;
+    # use ONLY $remote_addr (logs, limits, X-Forwarded-For/X-Real-IP to the app)
+    proxy_set_header X-Real-IP       $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    ...
+}
+```
+
+The rules behind it:
+
+- **Never use `$proxy_protocol_addr`.** It is the raw value of whatever header arrived. nginx applies no trust check to it.
+- **Use `$remote_addr`.** It is rewritten from the header **only** when the TCP peer matches `set_real_ip_from`.
+- **The listener must be unreachable for everyone but the shim.** A `proxy_protocol` listen *requires* a header. If it is bound to `0.0.0.0` or the container IP, any peer on haproxy-net or the app network can connect and send a forged header. If it is bound to loopback, only processes inside the container can.
+- **Loopback is acceptable on this listener**, unlike the default upstream. On this listener `$remote_addr` becomes the client address carried by the shim's header, so proxied clients never appear as 127.0.0.1.
+  - The shim always sends a header here: the real client's address, the direct peer's address for header-less connections, or LOCAL for haproxy's health probes.
+- **Non-nginx apps** must apply the same two rules: accept PROXY only from the shim's source address, and bind the listener so that only the shim can reach it. The e2e app (`tests/e2e/proxy-protocol/app.py`) does both. The e2e test asserts that a forged header sent straight to that listener from another container, or from the container's own non-loopback IP, is not adopted.
+
+The default upstream (no app opt-in, `auto:$SSL_HTTPS_PORT`) is the **container's own non-loopback IP**, never 127.0.0.1. On that path the app sees the TCP peer. If the peer were loopback, an app ACL such as `allow 127.0.0.1` or "localhost is admin" would start admitting every internet client. If no non-loopback address can be found, the shim exits with status 2: the wrapper does not restart it, and ssl-setup registers `none`.
 
 **The shim is Python asyncio.** It is fine for the current traffic levels. A high-throughput TLS service can opt out (`SSL_PROXY_PROTOCOL=off`), or a future version can replace the shim with a native one using the same CLI. See risk R4.
 
@@ -109,12 +132,19 @@ The shim connects to the app via the **container's own non-loopback IP** (`auto:
 
 | Value | Meaning |
 |---|---|
-| `auto` (default, as specified by the owner) | The directly connected subnet through which `HAPROXY_HOST` is reached, i.e. the docker haproxy-net subnet (172.20.0.0/16 here) |
-| `haproxy` | Only haproxy's current IP(s). Strict. |
+| `haproxy` (**default**) | Only the current IP(s) of `HAPROXY_HOST`, resolved via docker DNS |
+| `auto` | The directly connected subnet through which `HAPROXY_HOST` is reached, i.e. the whole haproxy-net subnet (172.20.0.0/16 here). Not recommended: every container on haproxy-net could then assert client IPs. |
 | `<CIDR>`, `<IP>` lists | Static entries |
 | `none` | Trust no one |
 
-- Dynamic entries are re-resolved every 60 s, and on a miss at most every 5 s. A haproxy that starts later than the backend, or restarts with a new IP, is therefore followed without a backend restart. A DNS blip keeps the last good set.
+`SSL_PROXY_HAPROXY_ADDR=<ip|cidr>[,…]` pins haproxy's address statically. It is trusted in addition to the DNS name.
+
+The policy **fails closed**:
+
+- **TTL.** The resolved set is cached for at most 10 s. Any lookup after that re-resolves, on a hit as well as a miss. A miss also forces a re-resolution, rate-limited to once every 5 s.
+- **haproxy restarts with a new IP.** The new IP is trusted on its first connection. The old IP stops being trusted within 10 s, because the old address may now belong to another container.
+- **Name stops resolving** (haproxy removed, DNS failure). The dynamic set is **cleared**, never kept from cache. Headers are rejected and the closed connections are logged, until the name resolves again. Pin the address with `SSL_PROXY_HAPROXY_ADDR` if a docker-DNS outage must not turn into rejected traffic.
+- **Name resolves to more than one address.** A loud warning is logged on every change of the set: a duplicate or impostor container may be using the name or alias.
 - `0.0.0.0/0` and garbage values are refused at startup (fail closed, loudly).
 - **Untrusted peer that starts with the v2 signature: the connection is closed** (logged, rate-limited). The header is never stripped-and-continued and never passed to the app.
 - Untrusted peer without a header: served normally.
@@ -140,9 +170,10 @@ The shim connects to the app via the **container's own non-loopback IP** (`auto:
 | # | What happens | Effect | Handling |
 |---|---|---|---|
 | F1 | Header sent to a non-aware listener | that listener's protocol breaks | Header only on explicit opt-in, plus the separate `*_proxy_port` target, plus image ordering (§7). |
-| F2 | Trust CIDR missing or wrong (for example `HAPROXY_HOST` unresolvable at boot) | headers rejected, so :80/:443 for that backend fail closed | Lazy re-resolution (5 s). `describe()` is logged at start. A typo fails at startup. |
-| F3 | haproxy health checks | – | Checks carry a LOCAL header. Both receivers accept it, and connect-only probes are fine. *Tested: all `-pp` servers UP.* |
-| F4 | Shim up, app down | haproxy shows the https server **UP** (it checks the shim). Clients get an immediate close, as before. | Monitoring that relied on haproxy's view of the app port must probe the app. Single-server backends route the same either way. |
+| F2 | Trust set empty or wrong (for example `HAPROXY_HOST` unresolvable, or a DNS outage) | headers rejected, so :80/:443 for that backend fail closed | Re-resolution on a miss (5 s) and TTL 10 s. `describe()` is logged at start. A typo fails at startup. Pin the address with `SSL_PROXY_HAPROXY_ADDR`. |
+| F3 | haproxy health checks | – | Checks carry a LOCAL header. Both receivers accept it, and connect-only probes are fine. *Tested: the mock logs a LOCAL header from the checks on :80, :8445 and :50005, and all `-pp` servers are UP.* |
+| F4 | Shim up, app down | haproxy shows the https server **UP** (it checks the shim). Clients get an immediate close, as before. | Monitoring that relied on haproxy's view of the app port must probe the app. |
+| F10 | Shim (or any PROXY listener) dead | the primary server goes DOWN after 3 failed checks (up to about 30 s) | Every `-pp` backend has a header-less `backup` server `<c>-plain` on the plain port (`http_port`, `https_port` or extra target). haproxy fails over to it, so the app is reached without a header. *Tested: shim killed, https still served via the backup.* |
 | F5 | Hairpin and container-to-container traffic (same network, no header) | – | Served unchanged. Via haproxy it carries a header with the hairpin source. *Tested: nonce check via haproxy, direct :80/:443/:8445.* |
 | F6 | Slow or partial header | – | 5 s deadline. A partial signature of 12 bytes or more is rejected. A shorter non-signature prefix is treated as plain data. Split-across-segments headers are handled. *Unit-tested.* |
 | F7 | Oversized header | – | Payload over 1024 bytes is rejected. *Tested.* |
@@ -165,12 +196,12 @@ The order and work needed for each consumer:
 
 | Order | Service | Action | App sees real IP on :443 after |
 |---|---|---|---|
-| 1 | unibro-vm-proxy | rebuild on the new base | shim only. For the app: nginx `listen 8446 ssl proxy_protocol` + `SSL_PROXY_HTTPS_UPSTREAM=auto:8446`, `…_PROTOCOL=v2` |
-| 2 | praxis ingress (autossl) | bump the pinned ssl-manager digest in `config/ingress/Dockerfile.autossl` and rebuild | as above, in `templates/default.conf.template`; set XFF from `$proxy_protocol_addr` (the app requires exactly one XFF value) |
+| 1 | unibro-vm-proxy | rebuild on the new base | shim only. For the app, use the §4 nginx pattern (`listen 127.0.0.1:8446 ssl proxy_protocol`, `set_real_ip_from 127.0.0.1/32`, `real_ip_header proxy_protocol`, `$remote_addr`) with `SSL_PROXY_HTTPS_UPSTREAM=127.0.0.1:8446` and `…_PROTOCOL=v2` |
+| 2 | praxis ingress (autossl) | bump the pinned ssl-manager digest in `config/ingress/Dockerfile.autossl` and rebuild | the same §4 pattern in `templates/default.conf.template`. Keep `proxy_set_header X-Forwarded-For $remote_addr` (a single value, as the app requires). `$remote_addr` is the client only because of `set_real_ip_from 127.0.0.1/32`. |
 | 3 | voxiverse-game | rebuild | as above (`voxiverse.conf.template`) |
 | 4 | concierge-backend | rebuild. **:80 rate limits become per-client immediately** (first XFF value is now trustworthy). | Node cannot read PROXY; the app keeps seeing the shim address on HTTPS. Needs a Node PROXY wrapper or an nginx front (escalated). |
 | 5 | fulcrum-alpha | rebuild. Only :80 and the :443 SNI route change; the 50001-50004 extras stay `none`. | Per-IP limits stay global until Fulcrum is patched or an extra-port shim is added (escalated). |
-| – | linkr-*-tls, agent-crm-prod-edge, ipfs-kubo | not ssl-manager. Change the registration (`lib/haproxy-api.mjs`, the manual map line) to `proxy_protocol:v2` with `http_proxy_port`/`https_proxy_port` pointing at **new** nginx `proxy_protocol` listeners. Deploy nginx before re-registering. | yes (nginx `real_ip_header proxy_protocol`) |
+| – | linkr-*-tls, agent-crm-prod-edge, ipfs-kubo | not ssl-manager. Change the registration (`lib/haproxy-api.mjs`, the manual map line) to `proxy_protocol:v2` with `http_proxy_port`/`https_proxy_port` pointing at **new** nginx `proxy_protocol` listeners. Deploy nginx before re-registering. Here the PROXY peer is haproxy itself, so: `set_real_ip_from <haproxy IP>/32` (not the subnet), `real_ip_header proxy_protocol`, `$remote_addr` only. Firewall or ACL the PROXY listener to haproxy's address too: an nginx PROXY listen on haproxy-net is reachable by every container there. | yes |
 | – | aggregator-gateway, friendly-dashboard, uniquake | no change possible without app code or a front. Leave them `none`. | no |
 
 ## 8. Rollback
@@ -184,8 +215,10 @@ Choose the scope:
 
 ## 9. Security notes and open risks
 
-- **R1, default trust is the whole haproxy-net subnet.** Any container on haproxy-net can assert an arbitrary client IP to any new backend. It does this by connecting directly and sending a header. The e2e test shows this as INFO.
-  - haproxy-net is shared by unrelated stacks. **Recommendation:** make `SSL_PROXY_TRUSTED_CIDRS=haproxy` the default, which only trusts haproxy's IP and is re-resolved. It was implemented and e2e-tested with `new2`. It is not the default only because the directive asked for the subnet. Owner decision.
+- **R1, trust boundary.** The default is `haproxy`: only haproxy's current address, failing closed. The e2e test asserts that a forged header from another haproxy-net container to a default-config backend is rejected with an immediate close.
+  - Residual risk 1: anything that can take over haproxy's docker DNS name or alias on haproxy-net is trusted. That is why a multi-address warning is logged.
+  - Residual risk 2: `auto` (the whole subnet) remains available as an explicit opt-in, but it lets every container on that shared network assert client IPs.
+  - Trade-off: a docker-DNS outage now means rejected PROXY connections, unless `SSL_PROXY_HAPROXY_ADDR` pins the address.
 - **R2, the app sees the shim on TLS.** The default rollout gives the *ssl-manager layer* the real IP on :443. Apps get it only after the per-service opt-in (§7). Node and Fulcrum need code. Escalated rather than silently re-scoped.
 - **R3, F4 health semantics change** (shim UP while app down).
 - **R4, shim performance.** It is a Python asyncio byte pump on every TLS byte. It was not load-tested. Before turning it on for a high-traffic TLS service, measure it, or opt out for that service.

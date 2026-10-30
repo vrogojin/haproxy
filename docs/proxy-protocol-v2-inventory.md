@@ -51,7 +51,7 @@ The result is that **no backend sees a real client IP on `:443` or on the TCP ex
 
 | Group | Services | Native PROXY? |
 |---|---|---|
-| ssl-mgr + nginx | unibro-vm-proxy, voxiverse, praxis ingress | Yes, via a dedicated `listen <port> ssl proxy_protocol;` server block |
+| ssl-mgr + nginx | unibro-vm-proxy, voxiverse, praxis ingress | Yes, via a dedicated loopback-only `listen 127.0.0.1:<port> ssl proxy_protocol;` server block with `set_real_ip_from 127.0.0.1/32` and `$remote_addr` (design §4) |
 | ssl-mgr + app TLS | concierge (Node), fulcrum (C++) | No. Use the ssl-manager shim; the app sees the shim's address. |
 | custom nginx | linkr, agent-crm-edge, ipfs-kubo, faucet | Yes, with an nginx config change |
 | custom Node or app TLS | aggregator-gateway, friendly-dashboard, uniquake | No. These need code, or an nginx/ssl-manager front. |

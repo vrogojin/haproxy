@@ -88,6 +88,8 @@ haproxy can prepend a PROXY v2 header so that your backend learns the real clien
 
 - ssl-manager images from the `proxy-protocol-v2-default` release do this automatically. Opt out with `SSL_PROXY_PROTOCOL=off`.
 - Other backends set it only for listeners that really parse PROXY v2. With nginx that means `listen <port> [ssl] proxy_protocol;`, and the listener should be a **dedicated** port given as `http_proxy_port`/`https_proxy_port`, so that the plain `http_port`/`https_port` stays the header-less fallback.
+  - Configure that nginx listener with `set_real_ip_from <haproxy IP>/32; real_ip_header proxy_protocol;` and read **only `$remote_addr`**. Never use `$proxy_protocol_addr`: it is whatever header arrived, unchecked.
+  - Restrict the listener to haproxy's address (`allow <haproxy IP>; deny all;` or an equivalent firewall rule). Every container on haproxy-net can reach it and could otherwise send a forged header.
 
 See [docs/PROXY-PROTOCOL-V2-DESIGN.md](docs/PROXY-PROTOCOL-V2-DESIGN.md).
 
