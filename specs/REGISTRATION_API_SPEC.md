@@ -108,7 +108,10 @@ POST /v1/backends
 | `http_port` | integer or null | no | `80` | HTTP port on the backend container. Set to `null` to skip HTTP routing. |
 | `https_port` | integer or null | no | `443` | HTTPS port on the backend container. Set to `null` to skip HTTPS routing. |
 | `map_port` | integer or null | no | `null` | Map download port (routed via HAProxy port 8000). Set to `null` to skip. |
-| `extra_ports` | array or null | no | `null` | Additional port mappings beyond http/https/map. Each entry: `{"listen": <int>, "target": <int>, "mode": "http"|"tcp"}`. See Section 2.4. |
+| `extra_ports` | array or null | no | `null` | Additional port mappings beyond http/https/map. Each entry: `{"listen": <int>, "target": <int>, "mode": "http"|"tcp", "proxy_protocol"?: "v2"|"none"}`. See Section 2.4. |
+| `proxy_protocol` | `"v2"`, `"none"` or null | no | `"none"` | (API v1.1) Send a PROXY protocol v2 header on the http and https server lines (`send-proxy-v2 check-send-proxy`). Only set it if those listeners accept PROXY v2. See Section 2.5. |
+| `http_proxy_port` | integer or null | no | `null` | (v1.1) While `proxy_protocol` is `"v2"`, route `:80` to this PROXY-aware port instead of `http_port`. Requires `proxy_protocol: "v2"` and a non-null `http_port`. |
+| `https_proxy_port` | integer or null | no | `null` | (v1.1) While `proxy_protocol` is `"v2"`, route `:443` SNI traffic to this PROXY-aware port instead of `https_port`. ssl-manager uses its TLS shim port (8445). Requires `proxy_protocol: "v2"` and a non-null `https_port`. |
 
 Port values must be in range 1-65535 when specified.
 
@@ -538,6 +541,18 @@ ports:
     - "443:443"
     - "50001-50004:50001-50004"
 ```
+
+---
+
+### 2.5 PROXY protocol v2 (API v1.1)
+
+Design, compatibility matrix and rollout: [docs/PROXY-PROTOCOL-V2-DESIGN.md](../docs/PROXY-PROTOCOL-V2-DESIGN.md).
+
+- The feature is opt-in per registration. A client that omits the fields gets exactly the pre-v1.1 behaviour. `GET /v1/health` advertises `"features": ["proxy_protocol_v2"]`.
+- PROXY servers get dedicated backend names: `<c>-http-pp`, `<c>-http-<p>-pp`, `<c>-https[-<p>]-pp` and `<c>-extra-<listen>-pp`.
+- `domains.map` persists the options as trailing tokens: `pp=v2`, `pp-http=<p>`, `pp-https=<p>` and `pp-extra=<l>[,<l>]`. When the tokens are present, a `-` placeholder sits in the map_port column. Pre-v1.1 generators ignore the tokens, so a rollback falls back to `http_port`/`https_port` without a header.
+- `*_proxy_port` values are backend targets. They are not checked against `ALLOWED_PORTS`, but 8000 and 8404 are refused (`PORT_NOT_ALLOWED`).
+- An unknown mode (including `"v1"`) is rejected with 422 `VALIDATION_ERROR`. So is a `*_proxy_port` without `proxy_protocol: "v2"`.
 
 ---
 

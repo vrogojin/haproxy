@@ -82,6 +82,15 @@ Containers built on [ssl-manager](https://github.com/unicitynetwork/ssl-manager)
 > (e.g. `openssl s_client -connect localhost:<port> | openssl x509 -noout -dates`).
 > Proper fix belongs in ssl-manager's deploy-hook; until then each backend must handle it.
 
+### Real client IPs (PROXY protocol v2, API v1.1)
+
+haproxy can prepend a PROXY v2 header so that your backend learns the real client IP, even through TLS passthrough. It does this **only** for backends that register with `"proxy_protocol": "v2"`:
+
+- ssl-manager images from the `proxy-protocol-v2-default` release do this automatically. Opt out with `SSL_PROXY_PROTOCOL=off`.
+- Other backends set it only for listeners that really parse PROXY v2. With nginx that means `listen <port> [ssl] proxy_protocol;`, and the listener should be a **dedicated** port given as `http_proxy_port`/`https_proxy_port`, so that the plain `http_port`/`https_port` stays the header-less fallback.
+
+See [docs/PROXY-PROTOCOL-V2-DESIGN.md](docs/PROXY-PROTOCOL-V2-DESIGN.md).
+
 For the full API specification, see [specs/REGISTRATION_API_SPEC.md](specs/REGISTRATION_API_SPEC.md).
 
 ---
