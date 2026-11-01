@@ -29,12 +29,14 @@ total=0
 
 setup_tmpdir() {
     TMPDIR="$(mktemp -d)"
+    export HAPROXY_STATE_DIR="${TMPDIR}/state"
     trap 'rm -rf -- "$TMPDIR"' EXIT
 
     mkdir -p "${TMPDIR}/conf.d" "${TMPDIR}/maps" "${TMPDIR}/templates"
 
     # Copy templates from the repo
     cp "${REPO_DIR}/templates/00-global.cfg" "${TMPDIR}/templates/"
+    cp "${REPO_DIR}/templates/05-resolvers.cfg" "${TMPDIR}/templates/"
     cp "${REPO_DIR}/templates/10-frontends.cfg" "${TMPDIR}/templates/"
     cp "${REPO_DIR}/templates/15-frontend-mapdownload.cfg" "${TMPDIR}/templates/"
 }
@@ -189,7 +191,7 @@ EOF
 
     # 50003: single domain HTTP -> map routing
     assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "frontend extra-http-50003" "http frontend for 50003"
-    assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "req\\.hdr(host)" "host-based routing for http"
+    assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "req\\.hdr\\(host\\)" "host-based routing for http"
 
     # 50004: single domain TCP -> default_backend
     assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "frontend extra-tcp-50004" "tcp frontend for 50004"
@@ -248,7 +250,7 @@ EOF
 
     assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "frontend extra-http-50003" "http frontend"
     assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "mode http" "http mode"
-    assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "req\\.hdr(host)" "host-based routing"
+    assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "req\\.hdr\\(host\\)" "host-based routing"
     assert_file_not_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "default_backend" "no default_backend for http"
 }
 
@@ -338,6 +340,96 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Test 9: PROXY protocol v2 tokens
+# ---------------------------------------------------------------------------
+
+test_proxy_protocol() {
+    echo "--- Test 9: PROXY protocol v2 tokens ---"
+    setup_tmpdir
+
+    local map_file="${TMPDIR}/domains.map"
+    cat > "$map_file" << 'EOF'
+legacy.example.com  legacy-svc  80  443
+pp.example.com      pp-svc      80  443  -  pp=v2  pp-https=8445
+pphttp.example.com  pphttp-svc  80  -    -  pp=v2
+pport.example.com   pport-svc   80  443  -  pp=v2  pp-http=8081  pp-https=8446
+ppx.example.com     ppx-svc     80  50002  -  extra:50001:50001:tcp  extra:50003:50003:http  pp-extra=50001
+col5.example.com    col5-svc    80  443  pp=v2
+EOF
+
+    run_generate "$map_file"
+    local be="${TMPDIR}/conf.d/20-backends.cfg"
+
+    # Legacy entry: unchanged names, no PROXY header
+    assert_file_contains "$be" "^backend legacy-svc-http$" "legacy http backend name unchanged"
+    assert_file_contains "$be" "server legacy-svc legacy-svc:80 .*rise 2$" "legacy http server has no send-proxy"
+    assert_file_contains "$be" "server legacy-svc legacy-svc:443 .*rise 2$" "legacy https server has no send-proxy"
+    assert_file_not_contains "$be" "legacy-svc:.*send-proxy" "no send-proxy on legacy entry"
+
+    # pp=v2 + pp-https: http -> :80 with header, https -> shim port with header
+    assert_file_contains "${TMPDIR}/maps/http-domains.map" "pp\\.example\\.com +pp-svc-http-pp$" "pp http map -> -pp backend"
+    assert_file_contains "${TMPDIR}/maps/https-domains.map" "pp\\.example\\.com +pp-svc-https-8445-pp$" "pp https map -> shim backend"
+    assert_file_contains "$be" "server pp-svc pp-svc:80 .* send-proxy-v2 check-send-proxy resolve-opts allow-dup-ip$" "pp http server sends PROXY v2"
+    assert_file_contains "$be" "server pp-svc pp-svc:8445 .* send-proxy-v2 check-send-proxy resolve-opts allow-dup-ip$" "pp https server targets shim with PROXY v2"
+    assert_file_not_contains "$be" "server pp-svc pp-svc:443" "pp https never targets the raw app port"
+
+    # every -pp backend has a header-less backup on the PLAIN port (M5)
+    assert_file_contains "$be" "server pp-svc-plain pp-svc:443 .* backup$" "https-pp backend has plain backup -> https_port"
+    assert_file_contains "$be" "server pp-svc-plain pp-svc:80 .* backup$" "http-pp backend has plain backup -> http_port"
+    assert_file_not_contains "$be" "server [a-z0-9-]+-plain .*send-proxy" "backup servers never send PROXY"
+    assert_file_contains "$be" "server pp-svc-plain .* resolve-opts allow-dup-ip backup$" "backup may share the primary's IP (else MAINT resolution)"
+    assert_file_contains "$be" "server pport-svc-plain pport-svc:80 .* backup$" "pp-http backend falls back to http_port"
+    assert_file_contains "$be" "server pport-svc-plain pport-svc:443 .* backup$" "pp-https backend falls back to https_port"
+    assert_file_contains "$be" "server ppx-svc-plain ppx-svc:50001 .* backup$" "extra-pp backend has a plain backup"
+    assert_file_not_contains "$be" "server legacy-svc-plain" "legacy entries get no backup server"
+
+    # pp=v2 without pp-https: header goes to the port itself (http-only entry here)
+    assert_file_contains "$be" "server pphttp-svc pphttp-svc:80 .* send-proxy-v2" "pp http-only entry sends PROXY v2"
+
+    # pp-http/pp-https: PROXY targets replace the plain ports only while pp=v2
+    assert_file_contains "${TMPDIR}/maps/http-domains.map" "pport\\.example\\.com +pport-svc-http-8081-pp$" "pp-http backend name"
+    assert_file_contains "$be" "server pport-svc pport-svc:8081 .* send-proxy-v2" "pp-http target gets PROXY v2"
+    assert_file_contains "$be" "server pport-svc pport-svc:8446 .* send-proxy-v2" "pp-https target gets PROXY v2"
+    assert_file_not_contains "$be" "server pport-svc pport-svc:(80|443) " "plain ports unused while pp=v2"
+
+    # pp-extra only for the listed listen port; top-level http/https stay plain
+    assert_file_contains "$be" "^backend ppx-svc-extra-50001-pp$" "pp extra backend has -pp suffix"
+    assert_file_contains "$be" "server ppx-svc ppx-svc:50001 .* send-proxy-v2" "pp extra sends PROXY v2"
+    assert_file_contains "$be" "^backend ppx-svc-extra-50003$" "non-pp extra unchanged"
+    assert_file_contains "$be" "server ppx-svc ppx-svc:50003 .*rise 2$" "non-pp extra has no send-proxy"
+    assert_file_contains "$be" "server ppx-svc ppx-svc:80 .*rise 2$" "extra-only pp leaves http plain"
+    assert_file_contains "${TMPDIR}/conf.d/30-extra-frontends.cfg" "default_backend ppx-svc-extra-50001-pp" "frontend routes to -pp extra backend"
+
+    # pp token in the map_port column (hand edit) is an option, not a map port
+    assert_file_contains "$be" "server col5-svc col5-svc:80 .* send-proxy-v2" "pp token in column 5 honoured"
+    assert_file_not_exists "${TMPDIR}/conf.d/15-frontend-mapdownload.cfg" "pp token in column 5 is not a map_port"
+}
+
+# ---------------------------------------------------------------------------
+# Test 10: invalid PROXY tokens never break an entry
+# ---------------------------------------------------------------------------
+
+test_proxy_protocol_garbage_tokens() {
+    echo "--- Test 10: invalid PROXY tokens are ignored, entry survives ---"
+    setup_tmpdir
+
+    local map_file="${TMPDIR}/domains.map"
+    cat > "$map_file" << 'EOF'
+bad.example.com  bad-svc  80  443  -  pp=v1  pp-https=99999  pp-extra=abc
+EOF
+
+    run_generate "$map_file"
+    local be="${TMPDIR}/conf.d/20-backends.cfg"
+    assert_file_contains "$be" "^backend bad-svc-http$" "unsupported pp mode falls back to plain backend"
+    cat > "$map_file" << 'EOF'
+last.example.com  last-svc  80  443  -  pp=v2  pp=none
+EOF
+    run_generate "$map_file"
+    assert_file_contains "$be" "^backend last-svc-http$" "last pp= token wins (pp=none after pp=v2)"
+    assert_file_not_contains "$be" "send-proxy" "no send-proxy for unsupported mode"
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 
@@ -349,6 +441,8 @@ test_http_extra_port
 test_container_mode
 test_backend_modes
 test_mixed_entries
+test_proxy_protocol
+test_proxy_protocol_garbage_tokens
 
 echo ""
 echo "==========================================="

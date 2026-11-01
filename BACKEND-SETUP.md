@@ -82,6 +82,20 @@ Containers built on [ssl-manager](https://github.com/unicitynetwork/ssl-manager)
 > (e.g. `openssl s_client -connect localhost:<port> | openssl x509 -noout -dates`).
 > Proper fix belongs in ssl-manager's deploy-hook; until then each backend must handle it.
 
+### Real client IPs (PROXY protocol v2, API v1.1)
+
+haproxy can prepend a PROXY v2 header so that your backend learns the real client IP, even through TLS passthrough. It does this **only** for backends that register with `"proxy_protocol": "v2"`:
+
+- ssl-manager images from the `proxy-protocol-v2-default` release do this automatically. Opt out with `SSL_PROXY_PROTOCOL=off`.
+- Other backends set it only for listeners that really parse PROXY v2. With nginx that means `listen <port> [ssl] proxy_protocol;`, and the listener should be a **dedicated** port given as `http_proxy_port`/`https_proxy_port`, so that the plain `http_port`/`https_port` stays the header-less fallback.
+  - Configure that nginx listener with `set_real_ip_from <haproxy IP>/32; real_ip_header proxy_protocol;` and read **only `$remote_addr`**. Never use `$proxy_protocol_addr`: it is whatever header arrived, unchecked.
+  - Do **not** put `allow <haproxy IP>; deny all;` on that listener: with `real_ip_header proxy_protocol` nginx has already replaced `$remote_addr` with the client IP when it evaluates `allow`/`deny`, so every real client would get 403 (haproxy's health checks would still pass, so nothing fails over). A forged header from an untrusted peer is never adopted into `$remote_addr` (it is only honoured from `set_real_ip_from`), so no http-level ACL is needed for that; if you want to restrict who can reach the listener, do it at the network level (separate docker network, or firewall on the peer address).
+  - Pin haproxy's address (a fixed `ipv4_address` in compose) before using it in `set_real_ip_from`: after a haproxy restart its old IP could be handed to another container on haproxy-net, which could then forge client IPs.
+  - `http_proxy_port` receives **all** port-80 traffic, including `/.well-known/acme-challenge/`. That listener must also serve ACME, or certificate renewal fails silently (the TCP health check will not notice).
+  - Re-registering without `proxy_protocol` turns it back off (absent means `none`); keep it in every re-registration.
+
+See [docs/PROXY-PROTOCOL-V2-DESIGN.md](docs/PROXY-PROTOCOL-V2-DESIGN.md).
+
 For the full API specification, see [specs/REGISTRATION_API_SPEC.md](specs/REGISTRATION_API_SPEC.md).
 
 ---
